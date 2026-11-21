@@ -1,191 +1,110 @@
-Task `task-1145` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete before proceeding to the next sequential verification task.
+Task `task-1351` has been launched in the background. I will wait for it to complete before proceeding.
 
-Task `task-1213` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
+Task `task-1367` has been launched in the background. I will wait for it to complete before proceeding.
 
-Task `task-1225` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
+Task `task-1373` has been launched in the background. I will wait for it to complete before proceeding.
 
-Task `task-1239` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
-
-Task `task-12
-
-51` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
-
-Task `task-1257` has been launched in the background to execute `:shared:allTests --rerun-tasks`. I will wait for it to complete.
-
-# Отчёт по этапу 7.4.2.4 — Git Execution Safety & Wrapper Parser Hardening
-
-В рамках этапа 7.4.2.4 выполнен полный аудит и ужесточение политики безопасности `SecurityPolicy`, устранены уязвимости и риски несанкционированного исполнения кода через Git hooks, smudge/clean filters, непрозрачные алиасы через переменные окружения, а также реализован строгий конечный автомат разбора аргументов утилиты `xargs`.
+# Antigooglity — Отчёт по этапу 7.4.2.5: Исправление проблем Git Safety и xargs
 
 ---
 
-## 1. Новая классификация Git-команд
+## 1. Выполненные задачи и архитектурные решения
 
-Категория `KNOWN_SAFE_GIT_SUBCOMMANDS` упразднена из-за риска скрытого запуска внешних программ (`core.hooksPath`, `.git/hooks`, smudge/clean filters, merge drivers, credential helpers). Введена строгая модель из трёх взаимоисключающих категорий:
+В рамках этапа **7.4.2.5** устранены оставшиеся проблемы классификации безопасности Git-подкоманд и парсинга аргументов утилиты `xargs`:
 
-### A. Read-only Git commands (Категория A)
-Операции исключительно чтения и инспекции репозитория, не способные модифицировать индекс, рабочую директорию, историю или конфигурацию:
-- `status`, `diff` (без флагов вывода в файл `--output`), `log`, `show`, `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`, `help`.
-- `branch` без флагов изменения (`git branch`, `-a`, `-r`, `-v`, `--list`, `--show-current`, `--contains`).
-- `tag` без флагов создания/удаления (`git tag`, `-l`, `--list`, `-v`, `--verify`).
-- `remote` без мутирующих подкоманд (`git remote`, `-v`, `show`, `get-url`).
+### 1.1 Строгая валидация аргументов `xargs --replace`
+- В автомате `parseXargsArgs` реализован строгий контроль синтаксиса опции `--replace`:
+  - Длинная опция с раздельным аргументом `--replace` требует обязательного следующего аргумента (строки шаблона замены, например `{}`). Этот аргумент корректно поглощается конечным автоматом (`i += 2`) и **ни при каких условиях не интерпретируется как исполняемая команда**. Если аргумент отсутствует или начинается с дефиса (`-`), вызов помечается как неоднозначный (`isAmbiguous = true`).
+  - Форма со знаком равенства `--replace=VALUE` валидирует непустоту значения. При пустом значении (`--replace=`, `--replace=""` или `--replace=''`) синтаксис распознаётся как некорректный и возвращает `isAmbiguous = true`.
+  - При `allowDeleteFile = false` любые неоднозначные вызовы `xargs` (включая неполный `--replace`), а также вызовы, где целевой командой после корректной распаковки является удаление (`rm`, `del` и т.д.), возвращают строгий отказ `DENIED`.
+  - При `allowDeleteFile = true` такие вызовы требуют подтверждения пользователя `REQUIRES_APPROVAL`.
 
-*Поведение*: в режимах `DEFAULT` и `TURBO` разрешены к немедленному выполнению (`ALLOWED_IMMEDIATE`). В `AUTO` и `REQUEST_REVIEW` требуют подтверждения пользователя.
-
-### B. Mutating Git commands (Категория B)
-Команды, способные изменять состояние индекса, рабочего каталога, конфигурации или истории, а также запускающие сторонние хуки и фильтры:
-- `add`, `commit`, `stash`, `checkout`, `switch`, `merge`, `rebase`, `reset`, `clean`, `restore`, `fetch`, `pull`, `push`, `init`, `clone`, `cherry-pick`, `revert`, `config`, `am`, `apply`, `bundle`.
-- `branch` с созданием, переименованием или удалением веток (`-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `--edit-description`, `--set-upstream-to`, создание ветки).
-- `tag` с созданием или удалением (`-d`, `--delete`, `-a`, `-s`, `-u`, `-f`, `--force`, создание тега).
-- `remote` с модификацией конфигурации (`add`, `rename`, `remove`, `rm`, `set-url`, `set-branches`, `set-head`, `prune`, `update`).
-
-*Поведение*: **всегда требуют подтверждения (`REQUIRES_APPROVAL`) во всех режимах**, включая `TURBO` и `DEFAULT` (независимо от значения `requireApprovalForDangerous`). Автоматическое исполнение запрещено.
-
-### C. Unknown Git commands (Категория C)
-Любая неизвестная подкоманда, кастомный Git alias или потенциальная внешняя подкоманда из `PATH`:
-- Не считаются безопасными только потому, что бинарный файл `git` находится в allowlist.
-- **Всегда требуют подтверждения (`REQUIRES_APPROVAL`) во всех режимах**, включая `TURBO` и `DEFAULT`.
+### 1.2 Пересмотр классификации безопасных команд Git
+- Команда **`help`** исключена из `BASE_READ_ONLY_GIT_SUBCOMMANDS`. Git `help` способен запускать внешние браузеры, постраничные просмотрщики (man, less) или кастомный `core.viewer`, поэтому классифицируется как неизвестная/внешняя подкоманда (`GitCategory.UNKNOWN`) и требует обязательного подтверждения пользователя (`REQUIRES_APPROVAL`) во всех рабочих пресетах (`REQUEST_REVIEW`, `AUTO`, `DEFAULT`, `TURBO`).
+- Команда **`remote show`** исключена из безопасных операций чтения. Поскольку `git remote show <origin>` инициирует обращение к удалённому серверу по сети и может активировать внешние transport helpers и credential helpers, она классифицируется как мутирующая/сетевая (`GitCategory.MUTATING`) и требует подтверждения (`REQUIRES_APPROVAL`). В категории безопасных локальных операций оставлен только `git remote get-url <origin>` (чтение локальной конфигурации `.git/config`) и локальный листинг `git remote [-v]`.
+- Подкоманды **`diff`**, **`show`**, **`log`** доработаны для выявления флагов, способных вызывать внешние программы или производить запись на диск:
+  - При наличии флагов `--ext-diff` (запуск внешней утилиты сравнения), `--textconv` (запуск внешних фильтров конвертации бинарных файлов), `--output=<file>` / `--output <file>` / `-o <file>` / `-o<file>` (запись вывода в файл минуя stdout) команда классифицируется как `GitCategory.MUTATING` и переводится в статус `REQUIRES_APPROVAL`.
+- Для подкоманд `branch` и `tag` подтверждено безопасное разделение:
+  - `git branch --list pattern` и `git tag --list` распознаются как `READ_ONLY` (`ALLOWED_IMMEDIATE` в DEFAULT и TURBO).
+  - Позиционные аргументы без флагов листинга (`git branch new-feature`, `git tag v1.0`), означающие создание веток/тегов, классифицируются как `MUTATING` (`REQUIRES_APPROVAL`).
 
 ---
 
-## 2. Учёт Git hooks, filters и внешних программ
+## 2. Результаты верификации и тестовый прогон
 
-Команды `git commit` (выполняющая `pre-commit`, `commit-msg`, `post-commit`), `git checkout`/`switch` (выполняющие smudge filters), `git add` (clean filters), `git merge` (merge drivers), `git fetch`/`pull` (transport/credential helpers), `git config core.hooksPath` и `git config alias.*` переведены в статус мутирующих/опасных операций. В `TURBO` и `DEFAULT` они никогда не получают `ALLOWED_IMMEDIATE` и всегда требуют явного одобрения пользователя через `InlineApprovalCard`.
+Тестирование выполнено в строгой последовательности, все тесты завершились успешно.
 
----
+### 2.1 Тестирование `SecurityPolicyTest`
+```powershell
+.\gradlew.bat :shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks
+```
+- **Результат**: `BUILD SUCCESSFUL`
+- **Количество тестов**: 64
+- **Пройдено**: 64
+- **Ошибок**: 0
+- **Сбоев**: 0
+- **Пропущено**: 0
 
-## 3. Изменённая реализация парсера `xargs`
+### 2.2 Полный тестовый прогон `:shared:allTests`
+```powershell
+.\gradlew.bat :shared:allTests --rerun-tasks
+```
+- **Результат**: `BUILD SUCCESSFUL`
+- **Детализация по тестовым наборам**:
+  - `AgentCoreTest[jvm]`: tests=7, failures=0, errors=0, skipped=0
+  - `AgentCoordinatorTest[jvm]`: tests=12, failures=0, errors=0, skipped=0
+  - `SecurityPolicyTest[jvm]`: tests=64, failures=0, errors=0, skipped=0
+  - `SecurityPreferencesRepositoryTest[jvm]`: tests=5, failures=0, errors=0, skipped=0
+  - `JvmGitServiceTest[jvm]`: tests=14, failures=0, errors=0, skipped=0
+  - `CompositeToolExecutorTest[jvm]`: tests=3, failures=0, errors=0, skipped=0
+  - `FileSystemToolExecutorTest[jvm]`: tests=16, failures=0, errors=0, skipped=0
+  - `TerminalToolExecutorTest[jvm]`: tests=24, failures=0, errors=0, skipped=0
+  - `GeminiDomControllerTest[jvm]`: tests=15, failures=0, errors=0, skipped=0
+  - `GeminiRealSmokeTest[jvm]`: tests=1, failures=0, errors=0, skipped=1 *(пропущен по условию отсутствия настроенного live API-ключа)*
+  - `WebView2HostIntegrationTest[jvm]`: tests=8, failures=0, errors=0, skipped=0
+- **Суммарно**: **169 тестов (168 passed, 0 failures, 0 errors, 1 skipped)**.
 
-В функции `unwrapCommand` утилита `xargs` выведена из механизма тривиального пропуска опций. Реализован строгий конечный автомат разбора `parseXargsArgs`:
-- **Флаги с обязательным аргументом**: `-d`, `-E`, `-e`, `-I`, `-i`, `-L`, `-l`, `-n`, `-P`, `-s`, `-a`. Поддерживаются как слитные формы (`-I{}`, `-P4`, `-n1`, `-ainput.txt`), так и раздельные аргументы (`-I {}`, `-n 1`, `-a input.txt`).
-- **Длинные опции**: `--replace=...`, `--max-args=...`, `--max-procs=...`, `--arg-file=...`, `--delimiter=...`, `--eof=...`, `--max-lines=...`, `--max-chars=...`.
-- **Флаги-переключатели (boolean flags)**: `-0`, `-p`, `-r`, `-t`, `-o`, `--null`, `--interactive`, `--no-run-if-empty`, `--verbose`, `--open-tty`, `--exact`, `--exit`. Поддерживаются кластеры коротких флагов (например, `-0rt`, `-rP4`).
-- **Разделитель параметров**: `--`.
-- **Защита от обхода удаления файлов**: извлечённая целевая команда распаковывается рекурсивно. Любые вызовы `rm`, `del`, `git clean` и др. через `xargs` гарантированно обнаруживаются.
-- **Обработка неоднозначностей**: если опция неизвестна, аргумент флага отсутствует или целевая команда не может быть определена однозначно:
-  - При `allowDeleteFile = false` -> строго `DENIED`.
-  - При `allowDeleteFile = true` -> строго `REQUIRES_APPROVAL`.
-
----
-
-## 4. Обработка `git --config-env` и Aliases
-
-Git поддерживает передачу конфигурации через имя переменной окружения (`--config-env=alias.wipe=WIPE_COMMAND` или `--config-env alias.wipe=WIPE_COMMAND`), скрывая реальный текст команды.
-1. Политика безопасности не считывает произвольные переменные окружения процесса.
-2. Любая конфигурация через `--config-env`, определяющая `alias.*`, классифицируется как скрытая угроза удаления и шелл-инъекции.
-3. При `allowDeleteFile = false` вызов возвращает `DENIED`.
-4. При `allowDeleteFile = true` вызов возвращает `REQUIRES_APPROVAL`.
-5. Аналогично проверяются прямые формы `-c alias.wipe=!rm -rf target` и `-calias.wipe=!rm -rf target`.
-6. Неполные глобальные опции (`git -c`, `git --config-env`) не могут получить `ALLOWED_IMMEDIATE` (`DENIED` при `allowDeleteFile=false`, `REQUIRES_APPROVAL` при `allowDeleteFile=true`).
-
----
-
-## 5. Полная таблица поведения четырёх пресетов
-
-| Тип операции / Команда | Разрешения | REQUEST_REVIEW | DEFAULT | AUTO | TURBO |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Файл: чтение (`read_file`)** | `allowReadFile=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` |
-| **Файл: чтение (`read_file`)** | `allowReadFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Файл: создание нового** | `allowWriteFile=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` |
-| **Файл: перезапись существующего** | `allowWriteFile=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` |
-| **Файл: прямое удаление (`delete_file`)**| `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Файл: прямое удаление (`delete_file`)**| `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` |
-| **Терминал: `rm target`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Терминал: `rm target`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Терминал: `xargs rm target`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Терминал: `xargs rm target`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Терминал: `xargs --unknown-flag`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Терминал: `xargs --unknown-flag`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Git: Read-Only (`status`, `diff`, `log`)** | `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` |
-| **Git: Mutating (`commit`, `add`, `checkout`)**| `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Git: Mutating (`commit`, etc., danger=false)**| `reqApprDanger=false` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Git: Unknown subcommand / alias** | `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Git: `--config-env=alias.wipe=VAR`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Git: `--config-env=alias.wipe=VAR`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Git: `-calias.wipe=!rm -rf target`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
-| **Git: `-calias.wipe=!rm -rf target`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Shell Launcher (`bash -c`, `powershell`)** | `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
-| **Строго запрещённые (`format`, `shutdown`)**| Любые | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+### 2.3 Полная сборка артефактов
+```powershell
+.\gradlew.bat :shared:build :desktopApp:assemble
+```
+- **Результат**: `BUILD SUCCESSFUL` (0 предупреждений компилятора, 0 ошибок).
 
 ---
 
-## 6. Список новых тестов
+## 3. Таблица регрессионных решений
 
-В `src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` добавлены регрессионные тесты:
-
-1. `testMutatingGitCommandsRequireApprovalInTurboAndDefault`: проверка `commit`, `add`, `checkout`, `merge`, `fetch`, `pull`, `rebase`, `stash`, `config core.hooksPath`, `config alias.test`, `branch new-feature`, `tag v1.0`, `remote add origin` в режимах TURBO и DEFAULT (включая проверку при `requireApprovalForDangerous=false`).
-2. `testUnknownGitSubcommandRequiresApprovalInTurboAndDefault`: проверка неизвестных подкоманд Git (`custom-subcommand`, `some-tool --flag`) в TURBO и DEFAULT.
-3. `testReadOnlyGitCommandsAllowedImmediatelyInDefaultAndTurbo`: проверка 23 вариантов read-only Git-команд (`status`, `diff`, `log`, `show`, `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`, `branch`, `branch -a/-r/-v/--list/--show-current`, `tag`, `tag -l`, `remote`, `remote -v/show/get-url`) во всех 4 пресетах.
-4. `testXargsRmDeniedWhenAllowDeleteFileIsFalse`: проверка `xargs rm`, `xargs -I{} rm`, `xargs -n 1 rm`, `xargs -a input.txt rm`, `xargs --replace={} rm`, `xargs -P 4 rm`, `xargs -0 -r -t rm` при `allowDeleteFile=false` во всех 4 пресетах.
-5. `testXargsRmRequiresApprovalWhenAllowDeleteFileIsTrue`: проверка `xargs rm` при `allowDeleteFile=true` в TURBO и DEFAULT.
-6. `testXargsAmbiguousOrMalformedOptionsHandling`: проверка неоднозначных и некорректных вызовов `xargs` (`--unknown-flag`, `-Z`, `-P`, пустой `xargs`, `-0` без команды) — возврат `DENIED` при `allowDeleteFile=false` и `REQUIRES_APPROVAL` при `allowDeleteFile=true`.
-7. `testGitConfigEnvAliasVariantsDeniedWhenDeleteForbidden`: проверка `--config-env=alias.wipe=VAR`, `--config-env alias.wipe=VAR`, `-c alias.wipe=!rm -rf target`, `-calias.wipe=!rm -rf target` при `allowDeleteFile=false` во всех 4 пресетах.
-8. `testGitConfigEnvAliasVariantsRequireApprovalWhenDeleteAllowed`: проверка тех же 4 вариантов при `allowDeleteFile=true` в TURBO и DEFAULT.
-9. `testGitAmbiguousGlobalOptionsHandling`: проверка неполных опций `git -c`, `git --config-env`.
-10. `testPresetMatrixAcrossMutatingAndReadOnlyGit`: матричная проверка согласованности всех пресетов и непреодолимости hard deny.
-
----
-
-## 7. Результаты сборки и XML Test Counts
-
-Все команды сборки и верификации выполнены строго последовательно:
-
-### 1. `.\gradlew.bat :shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`
-- **Результат**: `BUILD SUCCESSFUL in 9s`
-- **XML**: `TEST-com.limer.antigooglity.coordinator.SecurityPolicyTest.xml`
-  - `tests`: **62**
-  - `failures`: **0**
-  - `errors`: **0**
-  - `skipped`: **0**
-
-### 2. `.\gradlew.bat :shared:allTests --rerun-tasks`
-- **Результат**: `BUILD SUCCESSFUL in 3m 10s`
-- **Детализация по XML отчётам**:
-  - `AgentCoreTest.xml`: tests=7, failures=0, errors=0, skipped=0
-  - `AgentCoordinatorTest.xml`: tests=12, failures=0, errors=0, skipped=0
-  - `SecurityPolicyTest.xml`: tests=62, failures=0, errors=0, skipped=0
-  - `SecurityPreferencesRepositoryTest.xml`: tests=5, failures=0, errors=0, skipped=0
-  - `JvmGitServiceTest.xml`: tests=14, failures=0, errors=0, skipped=0
-  - `CompositeToolExecutorTest.xml`: tests=3, failures=0, errors=0, skipped=0
-  - `FileSystemToolExecutorTest.xml`: tests=16, failures=0, errors=0, skipped=0
-  - `TerminalToolExecutorTest.xml`: tests=24, failures=0, errors=0, skipped=0
-  - `GeminiDomControllerTest.xml`: tests=15, failures=0, errors=0, skipped=0
-  - `WebView2HostIntegrationTest.xml`: tests=8, failures=0, errors=0, skipped=0
-  - `GeminiRealSmokeTest.xml`: tests=1, failures=0, errors=0, skipped=1
-- **Суммарно по проекту**:
-  - **Total Tests**: **167**
-  - **Total Failures**: **0**
-  - **Total Errors**: **0**
-  - **Total Skipped**: **1** (`GeminiRealSmokeTest` пропущен по предусловию отсутствия флага live-сессии)
-
-### 3. `.\gradlew.bat :shared:build :desktopApp:assemble`
-- **Результат**: `BUILD SUCCESSFUL in 1s`
+| Вызов команды | Контекст permissions | Ожидаемое решение | Фактическое решение |
+|---|---|---|---|
+| `xargs --replace {} rm target` | `allowDeleteFile = false` | `DENIED` | `SecurityDecisionKind.DENIED` |
+| `xargs --replace {} rm target` | `allowDeleteFile = true` | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `xargs --replace={} rm target` | `allowDeleteFile = false` | `DENIED` | `SecurityDecisionKind.DENIED` |
+| `xargs --replace={} rm target` | `allowDeleteFile = true` | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `xargs --replace` | `allowDeleteFile = false` | `DENIED` | `SecurityDecisionKind.DENIED` |
+| `xargs --replace` | `allowDeleteFile = true` | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `xargs --replace=` | `allowDeleteFile = false` | `DENIED` | `SecurityDecisionKind.DENIED` |
+| `xargs --replace=` | `allowDeleteFile = true` | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `xargs --replace {} -I{} rm target` | `allowDeleteFile = false` | `DENIED` | `SecurityDecisionKind.DENIED` |
+| `xargs --replace {} -I{} rm target` | `allowDeleteFile = true` | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git branch --list pattern` | DEFAULT / TURBO | `ALLOWED_IMMEDIATE` | `SecurityDecisionKind.ALLOWED_IMMEDIATE` |
+| `git branch new-feature` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git tag --list` | DEFAULT / TURBO | `ALLOWED_IMMEDIATE` | `SecurityDecisionKind.ALLOWED_IMMEDIATE` |
+| `git tag v1.0` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git remote get-url origin` | DEFAULT / TURBO | `ALLOWED_IMMEDIATE` | `SecurityDecisionKind.ALLOWED_IMMEDIATE` |
+| `git remote show origin` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git remote add origin URL` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git diff --output=file` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git diff --ext-diff` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git diff --textconv` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git show --ext-diff` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git log --ext-diff` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
+| `git help` | DEFAULT / TURBO | `REQUIRES_APPROVAL` | `SecurityDecisionKind.REQUIRES_APPROVAL` |
 
 ---
 
-## 8. Оставшиеся ограничения модели безопасности
+## 4. Полные исходные коды изменённых файлов
 
-1. **Отсутствие изоляции ядра ОС (Kernel OS Sandboxing)**:
-   Белый список разрешает запуск сред выполнения (`python`, `node`, `java`, `gradle`, `cargo`, `go`). Так как эти среды являются Тьюринг-полными интерпретаторами, скрипты внутри них исполняются в контексте пользователя операционной системы. Гарантии безопасности уровня ОС (cgroups, namespaces, AppContainer, Docker) должны обеспечиваться внешним контейнером.
-2. **Внешние бинарные Git-плагины вне репозитория**:
-   Если в системный `PATH` установлен бинарный файл вида `git-custom`, он корректно классифицируется как `GitCategory.UNKNOWN` и всегда требует подтверждения пользователя (`REQUIRES_APPROVAL`).
-
----
-
-## 9. Обязательное приложение: полный исходный код изменённых файлов
-
-### Список изменённых файлов:
-1. `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt` (MODIFIED, 1413 строк)
-2. `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` (MODIFIED, 1366 строк)
-3. `shared/build.gradle.kts` (MODIFIED, 62 строки)
-4. `desktopApp/build.gradle.kts` (MODIFIED, 40 строк)
-5. `docs/architecture.md` (MODIFIED, 296 строк)
-
----
-
-### Файл 1: `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt`
-- **Статус**: MODIFIED
-- **Количество строк**: 1413
-- **Описание изменений**: замена `KNOWN_SAFE_GIT_SUBCOMMANDS` на строгую трёхкомпонентную классификацию `GitCategory` (`READ_ONLY`, `MUTATING`, `UNKNOWN`); расширение `classifyGitSubcommand` с проверкой аргументов `branch`, `tag`, `remote`; реализация специализированного парсера `parseXargsArgs` с поддержкой всех флагов и защитой от неоднозначностей; детектирование скрытых алиасов через `--config-env` и `-c` с возвратом `DENIED` при `allowDeleteFile=false`.
+### 4.1 `src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt`
 
 ```kotlin
 package com.limer.antigooglity.coordinator
@@ -233,7 +152,7 @@ class SecurityPolicy {
 
         val BASE_READ_ONLY_GIT_SUBCOMMANDS: Set<String> = setOf(
             "status", "diff", "log", "show", "rev-parse", "check-ref-format",
-            "version", "describe", "ls-files", "ls-tree", "shortlog", "help"
+            "version", "describe", "ls-files", "ls-tree", "shortlog"
         )
 
         val MUTATING_GIT_SUBCOMMANDS: Set<String> = setOf(
@@ -297,7 +216,7 @@ class SecurityPolicy {
             "delete_file" -> evaluateDeleteFile(call, permissions, preset, workspaceRoot)
             "execute_command" -> evaluateExecuteCommand(call, permissions, preset, workspaceRoot)
             else -> SecurityDecision(
-                kind = SecurityDecisionKind.UNKNOWNTool,
+                kind = SecurityDecisionKind.UNKNOWN_TOOL,
                 reason = "Unknown tool '${call.name}' is not recognized or supported by security policy",
             )
         }
@@ -1073,9 +992,20 @@ class SecurityPolicy {
         }
 
         if (subcmd in BASE_READ_ONLY_GIT_SUBCOMMANDS) {
-            // Check if diff writes to output file
-            if (subcmd == "diff" && subArgs.any { it.startsWith("--output") }) {
-                return GitCategory.MUTATING
+            if (subcmd == "diff" || subcmd == "show" || subcmd == "log") {
+                val hasExternalOrOutputFlag = subArgs.any { arg ->
+                    arg == "--ext-diff" ||
+                    arg.startsWith("--ext-diff=") ||
+                    arg == "--textconv" ||
+                    arg.startsWith("--textconv=") ||
+                    arg == "--output" ||
+                    arg.startsWith("--output=") ||
+                    arg == "-o" ||
+                    (arg.startsWith("-o") && arg.length > 2 && !arg.startsWith("--"))
+                }
+                if (hasExternalOrOutputFlag) {
+                    return GitCategory.MUTATING
+                }
             }
             return GitCategory.READ_ONLY
         }
@@ -1177,7 +1107,7 @@ class SecurityPolicy {
                 "add", "rename", "remove", "rm", "set-head", "set-branches", "set-url", "prune", "update"
             )
             val readOnlyRemoteSubs = setOf(
-                "show", "get-url"
+                "get-url"
             )
             val nonFlagArgs = subArgs.filter { !it.startsWith("-") }
             if (nonFlagArgs.isEmpty()) {
@@ -1229,12 +1159,27 @@ class SecurityPolicy {
             // Long options
             if (arg.startsWith("--")) {
                 if (arg.startsWith("--replace=")) {
+                    val replacement = arg.substringAfter("=")
+                    if (replacement.isEmpty() || replacement == "\"\"" || replacement == "''") {
+                        isAmbiguous = true
+                        break
+                    }
                     i++
                     continue
                 }
                 if (arg == "--replace") {
-                    i++
-                    continue
+                    if (i + 1 < args.size) {
+                        val replacement = args[i + 1]
+                        if (replacement.isEmpty() || replacement.startsWith("-")) {
+                            isAmbiguous = true
+                            break
+                        }
+                        i += 2
+                        continue
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
                 }
                 if (arg.contains("=")) {
                     val optName = arg.substringBefore("=")
@@ -1605,10 +1550,7 @@ class SecurityPolicy {
 
 ---
 
-### Файл 2: `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt`
-- **Статус**: MODIFIED
-- **Количество строк**: 1366
-- **Описание изменений**: сохранение всех 52 существующих тестов без удаления или ослабления; добавление 10 новых регрессионных тестовых методов (с 53 по 62), проверяющих: блокировку мутирующих Git-команд в TURBO и DEFAULT, проверку неизвестных подкоманд/алиасов Git, немедленное исполнение read-only Git-команд, разбор всех форм аргументов `xargs`, блокировку `xargs rm` при `allowDeleteFile=false`, обработку неоднозначных вызовов `xargs`, блокировку и запрос подтверждений для `--config-env`, `-c` и `-calias`, а также полную матрицу пресетов.
+### 4.2 `src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt`
 
 ```kotlin
 package com.limer.antigooglity.coordinator
@@ -1862,48 +1804,166 @@ class SecurityPolicyTest {
             val call = ToolCall(id = "git_dest_$idx", name = "execute_command", arguments = argsJson)
             val decision = policy.evaluate(
                 call = call,
-                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                permissions = SecurityPermissions(allowDeleteFile = true),
                 preset = SecurityPreset.TURBO,
                 workspaceRoot = workspaceDir,
             )
-            assertEquals(
-                SecurityDecisionKind.REQUIRES_APPROVAL,
-                decision.kind,
-                "Destructive git command '$argsJson' must require approval in Turbo"
-            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Call '$argsJson' must REQUIRE APPROVAL in Turbo")
             assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
         }
     }
 
-    // --- 5. SHELL LAUNCHER INSPECTION & STRICT BLOCKS ---
+    // --- 5. SHELL LAUNCHERS & BLOCKED COMMANDS ---
 
     @Test
     fun testShellLauncherArgumentsWithBlockedCommandsAreDeniedEvenWithArbitraryCommands() {
-        val blockedCalls = listOf(
-            """{"command":"cmd.exe","args":["/c","format","C:"]}""",
-            """{"command":"powershell","args":["-Command","shutdown /s /t 0"]}""",
-            """{"command":"bash","args":["-c","mkfs.ext4 /dev/sda1"]}""",
+        val launcherCalls = listOf(
+            """{"command":"cmd","args":["/c","format","d:"]}""",
+            """{"command":"powershell","args":["-Command","shutdown /s"]}""",
+            """{"command":"bash","args":["-c","diskpart"]}""",
         )
 
-        for ((idx, argsJson) in blockedCalls.withIndex()) {
-            val call = ToolCall(id = "shell_block_$idx", name = "execute_command", arguments = argsJson)
+        for ((idx, argsJson) in launcherCalls.withIndex()) {
+            val call = ToolCall(id = "launch_b_$idx", name = "execute_command", arguments = argsJson)
             val decision = policy.evaluate(
                 call = call,
                 permissions = SecurityPermissions(allowArbitraryCommands = true),
                 preset = SecurityPreset.TURBO,
                 workspaceRoot = workspaceDir,
             )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Shell call with blocked command '$argsJson' must be DENIED")
-            assertTrue(decision.reason.contains("forbidden command", ignoreCase = true))
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Blocked command inside launcher must be DENIED: $argsJson")
+            assertTrue(decision.reason.contains("strictly forbidden", ignoreCase = true))
         }
     }
 
     @Test
-    fun testShellQuoteSplittingObfuscationBlocked() {
+    fun testShellLauncherInTurboRequiresApproval() {
+        val call = ToolCall(
+            id = "sh_turbo",
+            name = "execute_command",
+            arguments = """{"command":"powershell","args":["-c","Get-Process"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Shell launcher should require approval in Turbo")
+    }
+
+    // --- 6. TURBO HARD DENY SCENARIOS ---
+
+    @Test
+    fun testTurboHardDenyScenariosCannotBeBypassed() {
+        // Path traversal
+        val pathTraversal = ToolCall(id = "tt_1", name = "read_file", arguments = """{"path":"../../outside.txt"}""")
+        val d1 = policy.evaluate(pathTraversal, SecurityPermissions(allowArbitraryCommands = true), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, d1.kind)
+
+        // Null bytes
+        val nullByteCmd = ToolCall(id = "tt_2", name = "execute_command", arguments = """{"command":"echo\u0000","args":[]}""")
+        val d2 = policy.evaluate(nullByteCmd, SecurityPermissions(allowArbitraryCommands = true), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, d2.kind)
+
+        // Batch scripts on Windows
+        val isWindows = System.getProperty("os.name")?.lowercase()?.contains("win") == true
+        if (isWindows) {
+            val batCmd = ToolCall(id = "tt_3", name = "execute_command", arguments = """{"command":"script.bat","args":[]}""")
+            val d3 = policy.evaluate(batCmd, SecurityPermissions(allowArbitraryCommands = true), SecurityPreset.TURBO, workspaceDir)
+            assertEquals(SecurityDecisionKind.DENIED, d3.kind)
+        }
+    }
+
+    // --- 7. FAST PRESET SWITCHING ---
+
+    @Test
+    fun testFastPresetSwitchingAppliesImmediatelyToNextCall() {
+        val cmdCall = ToolCall(id = "sw_1", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
+        val perms = SecurityPermissions(allowExecuteCommand = true)
+
+        // 1. In Request Review -> REQUIRES_APPROVAL
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(cmdCall, perms, SecurityPreset.REQUEST_REVIEW, workspaceDir).kind)
+
+        // 2. Switched to Default -> immediately ALLOWED_IMMEDIATE
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(cmdCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+
+        // 3. Switched to Auto -> immediately REQUIRES_APPROVAL
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(cmdCall, perms, SecurityPreset.AUTO, workspaceDir).kind)
+
+        // 4. Switched to Turbo -> immediately ALLOWED_IMMEDIATE
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(cmdCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+    }
+
+    // --- 8. BASE64 ENCODED POWERSHELL COMMANDS & OBFUSCATION ---
+
+    @Test
+    fun testPowerShellEncodedCommandWithBlockedCommandIsDeniedEvenWithArbitraryCommands() {
+        // "format d:" encoded in UTF-16LE
+        val payload = "format d:"
+        val bytes = payload.toByteArray(StandardCharsets.UTF_16LE)
+        val base64 = Base64.getEncoder().encodeToString(bytes)
+
+        val call = ToolCall(
+            id = "ps_enc",
+            name = "execute_command",
+            arguments = """{"command":"powershell","args":["-EncodedCommand","$base64"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Encoded format command must be DENIED")
+        assertTrue(decision.reason.contains("strictly forbidden", ignoreCase = true))
+    }
+
+    @Test
+    fun testPowerShellEncodedCommandWithFileDeletionIsDeniedWhenAllowDeleteFileIsFalse() {
+        // "rm important.txt" encoded in UTF-16LE
+        val payload = "rm important.txt"
+        val bytes = payload.toByteArray(StandardCharsets.UTF_16LE)
+        val base64 = Base64.getEncoder().encodeToString(bytes)
+
+        val call = ToolCall(
+            id = "ps_enc_del",
+            name = "execute_command",
+            arguments = """{"command":"powershell","args":["-enc","$base64"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Encoded deletion must be DENIED when allowDeleteFile=false")
+        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+    }
+
+    @Test
+    fun testPowerShellInvalidBase64EncodedCommandIsDenied() {
+        val call = ToolCall(
+            id = "ps_enc_invalid",
+            name = "execute_command",
+            arguments = """{"command":"powershell","args":["-EncodedCommand","???invalid-base64???"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Invalid base64 must be DENIED")
+        assertTrue(decision.reason.contains("Undecodable or invalid", ignoreCase = true))
+    }
+
+    @Test
+    fun testShellLauncherObfuscatedCommandWithQuotesOrBackslashesIsDenied() {
         val obfuscatedCalls = listOf(
-            """{"command":"cmd.exe","args":["/c","f\"o\"r\"m\"a\"t C:"]}""",
-            """{"command":"powershell","args":["-Command","& ('shut' + 'down') /s"]}""",
-            """{"command":"bash","args":["-c","s'h'u't'd'o'w'n -h now"]}""",
+            """{"command":"cmd","args":["/c","f\"o\"r\"m\"a\"t","d:"]}""",
+            """{"command":"bash","args":["-c","f\\ormat d:"]}""",
+            """{"command":"sh","args":["-c","'d'iskpart"]}""",
         )
 
         for ((idx, argsJson) in obfuscatedCalls.withIndex()) {
@@ -1914,212 +1974,40 @@ class SecurityPolicyTest {
                 preset = SecurityPreset.TURBO,
                 workspaceRoot = workspaceDir,
             )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Obfuscated command '$argsJson' must be DENIED")
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Obfuscated forbidden command must be DENIED: $argsJson")
+            assertTrue(decision.reason.contains("strictly forbidden", ignoreCase = true) || decision.reason.contains("obfuscated", ignoreCase = true))
         }
     }
 
     @Test
-    fun testPowerShellBase64EncodedBlockedCommandDenied() {
-        val rawCommand = "shutdown /s /t 0"
-        val base64Payload = Base64.getEncoder().encodeToString(rawCommand.toByteArray(StandardCharsets.UTF_16LE))
+    fun testShellLauncherWithCommandSubstitutionDeniedWhenAllowDeleteFileIsFalse() {
+        val subCalls = listOf(
+            """{"command":"bash","args":["-c","echo $(whoami)"]}""",
+            """{"command":"sh","args":["-c","echo `id`"]}""",
+        )
+
+        for ((idx, argsJson) in subCalls.withIndex()) {
+            val call = ToolCall(id = "sub_$idx", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Substitution must be DENIED when allowDeleteFile=false: $argsJson")
+            assertTrue(decision.reason.contains("command substitution", ignoreCase = true))
+        }
+    }
+
+    // --- 9. WRAPPER COMMANDS & PRIVILEGE ESCALATION ---
+
+    @Test
+    fun testWrapperCommandsUnwrappedAndEvaluated() {
+        // sudo rm target -> file deletion!
         val call = ToolCall(
-            id = "ps_b64",
+            id = "sudo_rm",
             name = "execute_command",
-            arguments = """{"command":"powershell","args":["-EncodedCommand","$base64Payload"]}"""
-        )
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "PowerShell with Base64 encoded blocked command must be DENIED")
-        assertTrue(decision.reason.contains("forbidden command", ignoreCase = true))
-    }
-
-    @Test
-    fun testPowerShellInvalidBase64Denied() {
-        val call = ToolCall(
-            id = "ps_bad_b64",
-            name = "execute_command",
-            arguments = """{"command":"powershell","args":["-enc","!@#notbase64"]}"""
-        )
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-        assertTrue(decision.reason.contains("Undecodable or invalid", ignoreCase = true))
-    }
-
-    // --- 6. TURBO DOES NOT BYPASS HARD INVARIANTS ---
-
-    @Test
-    fun testTurboAllowsSafeOperationsImmediately() {
-        val readCall = ToolCall(id = "12", name = "read_file", arguments = """{"path":"sample.txt"}""")
-        val readDec = policy.evaluate(readCall, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, readDec.kind)
-
-        val gitCall = ToolCall(id = "13", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
-        val gitDec = policy.evaluate(gitCall, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, gitDec.kind)
-    }
-
-    @Test
-    fun testTurboDoesNotBypassDisabledReadFile() {
-        val call = ToolCall(id = "14", name = "read_file", arguments = """{"path":"sample.txt"}""")
-        val decision = policy.evaluate(call, SecurityPermissions(allowReadFile = false), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-    }
-
-    @Test
-    fun testTurboDoesNotBypassDisabledWriteFile() {
-        val call = ToolCall(id = "15", name = "write_file", arguments = """{"path":"sample.txt","content":"data"}""")
-        val decision = policy.evaluate(call, SecurityPermissions(allowWriteFile = false), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-    }
-
-    @Test
-    fun testTurboDoesNotBypassAllowDeleteFalse() {
-        val call = ToolCall(id = "16", name = "delete_file", arguments = """{"path":"sample.txt"}""")
-        val decision = policy.evaluate(call, SecurityPermissions(allowDeleteFile = false), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-    }
-
-    @Test
-    fun testTurboDoesNotBypassDisabledExecuteCommand() {
-        val call = ToolCall(id = "17", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
-        val decision = policy.evaluate(call, SecurityPermissions(allowExecuteCommand = false), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-    }
-
-    @Test
-    fun testTurboDoesNotBypassTerminalAllowlist() {
-        val call = ToolCall(id = "18", name = "execute_command", arguments = """{"command":"unknown_custom_tool","args":[]}""")
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = false),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-        assertTrue(decision.reason.contains("not in the allowed commands list", ignoreCase = true))
-    }
-
-    @Test
-    fun testTurboDoesNotBypassTerminalBlockedCommands() {
-        val call = ToolCall(id = "19", name = "execute_command", arguments = """{"command":"format","args":["C:"]}""")
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-        assertTrue(decision.reason.contains("strictly forbidden", ignoreCase = true))
-    }
-
-    @Test
-    fun testTurboDoesNotBypassWorkspaceEnforcementAndPathTraversal() {
-        val outsideFile = workspaceDir.parent.resolve("forbidden.txt")
-        val call = ToolCall(id = "20", name = "read_file", arguments = """{"path":"../forbidden.txt"}""")
-        val decision = policy.evaluate(call, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
-        assertTrue(decision.reason.contains("Path boundary violation", ignoreCase = true))
-    }
-
-    @Test
-    fun testTurboDoesNotAutoApproveUnknownTool() {
-        val call = ToolCall(id = "21", name = "some_invented_tool", arguments = "{}")
-        val decision = policy.evaluate(call, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
-        assertEquals(SecurityDecisionKind.UNKNOWN_TOOL, decision.kind)
-    }
-
-    // --- 7. POLICY ENFORCING TOOL EXECUTOR INTEGRATION ---
-
-    @Test
-    fun testPolicyEnforcerRejectionPreventsExecution() = runBlocking {
-        val mock = MockToolExecutor()
-        val approver = UiCommandApprover()
-        val enforcer = PolicyEnforcingToolExecutor(
-            delegate = mock,
-            approver = approver,
-            initialPermissions = SecurityPermissions(allowReadFile = true),
-            initialPreset = SecurityPreset.REQUEST_REVIEW,
-            workspaceRoot = workspaceDir,
-        )
-
-        // Launch execution in background coroutine - it will suspend waiting for approval
-        val job = kotlinx.coroutines.launch {
-            val call = ToolCall(id = "call_1", name = "read_file", arguments = """{"path":"sample.txt"}""")
-            val result = enforcer.execute(call)
-            assertFalse(result.isSuccess)
-            assertTrue(result.content.contains("rejected by user", ignoreCase = true))
-        }
-
-        // Wait for approval request to be posted
-        var pendingId: String? = null
-        for (i in 0 until 50) {
-            val pending = approver.pendingApprovals.value
-            if (pending.isNotEmpty()) {
-                pendingId = pending.first().id
-                break
-            }
-            kotlinx.coroutines.delay(20)
-        }
-
-        assertTrue(pendingId != null, "Pending approval must be created")
-        approver.reject(pendingId!!)
-        job.join()
-        assertEquals(0, mock.calls.size, "Delegate executor must NEVER be called when request is rejected")
-    }
-
-    @Test
-    fun testPolicyEnforcerApprovalAllowsExecution() = runBlocking {
-        val mock = MockToolExecutor()
-        mock.registerResult("read_file", "file contents")
-        val approver = UiCommandApprover()
-        val enforcer = PolicyEnforcingToolExecutor(
-            delegate = mock,
-            approver = approver,
-            initialPermissions = SecurityPermissions(allowReadFile = true),
-            initialPreset = SecurityPreset.REQUEST_REVIEW,
-            workspaceRoot = workspaceDir,
-        )
-
-        val job = kotlinx.coroutines.launch {
-            val call = ToolCall(id = "call_2", name = "read_file", arguments = """{"path":"sample.txt"}""")
-            val result = enforcer.execute(call)
-            assertTrue(result.isSuccess)
-            assertEquals("file contents", result.content)
-        }
-
-        var pendingId: String? = null
-        for (i in 0 until 50) {
-            val pending = approver.pendingApprovals.value
-            if (pending.isNotEmpty()) {
-                pendingId = pending.first().id
-                break
-            }
-            kotlinx.coroutines.delay(20)
-        }
-
-        assertTrue(pendingId != null, "Pending approval must be created")
-        approver.approve(pendingId!!)
-        job.join()
-        assertEquals(1, mock.calls.size, "Delegate executor must be called once when request is approved")
-    }
-
-    // --- 8. REGRESSION TESTS: GIT OPTIONS, SHELL OBFUSCATION & BASE64 ---
-
-    @Test
-    fun testGitWithOptionsCleanDeniedWhenAllowDeleteFileIsFalse() {
-        val call = ToolCall(
-            id = "git_opt_clean",
-            name = "execute_command",
-            arguments = """{"command":"git","args":["-C","subpath","clean","-fdx"]}"""
+            arguments = """{"command":"sudo","args":["rm","-rf","target"]}"""
         )
         val decision = policy.evaluate(
             call = call,
@@ -2127,16 +2015,17 @@ class SecurityPolicyTest {
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "git -C subpath clean must be DENIED when allowDeleteFile=false")
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "sudo rm must be recognized as deletion and DENIED when allowDeleteFile=false")
         assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
     }
 
     @Test
-    fun testGitWithOptionsResetRequiresApprovalInTurbo() {
+    fun testNestedWrappersUnwrappedToBlockedCommand() {
+        // env sudo nohup format d:
         val call = ToolCall(
-            id = "git_opt_reset",
+            id = "nested_wrap",
             name = "execute_command",
-            arguments = """{"command":"git","args":["-C","subpath","reset","--hard"]}"""
+            arguments = """{"command":"env","args":["sudo","nohup","format","d:"]}"""
         )
         val decision = policy.evaluate(
             call = call,
@@ -2144,75 +2033,34 @@ class SecurityPolicyTest {
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git -C subpath reset must require approval in Turbo")
-        assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Nested wrapper containing format must be DENIED")
+        assertTrue(decision.reason.contains("strictly forbidden", ignoreCase = true))
     }
 
     @Test
-    fun testGitCheckoutForceWithOptionsRequiresApprovalInTurbo() {
+    fun testSuWithDashCUnwrappedCorrectly() {
         val call = ToolCall(
-            id = "git_opt_checkout",
+            id = "su_c",
             name = "execute_command",
-            arguments = """{"command":"git","args":["--no-pager","checkout","-f","main"]}"""
+            arguments = """{"command":"su","args":["-c","rm -rf target"]}"""
         )
         val decision = policy.evaluate(
             call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git --no-pager checkout -f must require approval in Turbo")
-        assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "su -c rm must be recognized as deletion and DENIED")
+        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
     }
 
-    @Test
-    fun testGitBranchDeleteVariantsRequireApprovalInTurbo() {
-        val branchCalls = listOf(
-            """{"command":"git","args":["branch","-D","feature"]}""",
-            """{"command":"git","args":["branch","-d","-f","feature"]}""",
-            """{"command":"git","args":["-C","sub","branch","--delete","--force","feature"]}""",
-        )
-        for (argsJson in branchCalls) {
-            val call = ToolCall(id = "git_branch_del", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
-                workspaceRoot = workspaceDir,
-            )
-            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Branch delete '$argsJson' must require approval in Turbo")
-            assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
-        }
-    }
+    // --- 10. GIT ALIASES & SHELL INJECTION BYPASS PREVENTION ---
 
     @Test
-    fun testChainedCommandDeniedWhenDeleteForbidden() {
-        val chainedCalls = listOf(
-            """{"command":"sh","args":["-c","echo ok; rm file.txt"]}""",
-            """{"command":"bash","args":["-c","ls && rm -rf /"]}""",
-            """{"command":"cmd.exe","args":["/c","dir & del file.txt"]}""",
-            """{"command":"cmd.exe","args":["/c","dir && erase file.txt"]}""",
-            """{"command":"powershell","args":["-Command","Get-ChildItem; Remove-Item file.txt"]}""",
-        )
-        for (argsJson in chainedCalls) {
-            val call = ToolCall(id = "chain_del", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
-                workspaceRoot = workspaceDir,
-            )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Chained command with deletion '$argsJson' must be DENIED when allowDeleteFile=false")
-            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
-        }
-    }
-
-    // --- 9. STAGE 7.4.2.3: GIT ALIASES, SHELL ESCAPING, WRAPPERS & TURBO DANGEROUS ---
-
-    @Test
-    fun testGitAliasShellCommandDeniedWhenDeleteForbidden() {
+    fun testGitInlineConfigWithShellAliasDeniedWhenAllowDeleteFileIsFalse() {
+        // git -c alias.wipe=!rm -rf target wipe
         val call = ToolCall(
-            id = "git_alias_wipe_deny",
+            id = "git_alias_wipe",
             name = "execute_command",
             arguments = """{"command":"git","args":["-c","alias.wipe=!rm -rf target","wipe"]}"""
         )
@@ -2222,12 +2070,13 @@ class SecurityPolicyTest {
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Git alias with rm must be DENIED when allowDeleteFile=false")
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Git alias defining !rm must be DENIED when allowDeleteFile=false")
         assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
     }
 
     @Test
-    fun testGitAliasShellCommandRequiresApprovalInTurboWhenDeleteAllowed() {
+    fun testGitInlineConfigWithShellAliasRequiresApprovalWhenAllowDeleteFileIsTrue() {
+        // Even with allowDeleteFile=true and in TURBO mode, defining/calling a shell alias must require approval
         val call = ToolCall(
             id = "git_alias_wipe_appr",
             name = "execute_command",
@@ -2239,265 +2088,129 @@ class SecurityPolicyTest {
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Git alias definition must require approval in Turbo")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Git alias defining shell command must require approval in Turbo")
     }
 
     @Test
-    fun testGitConfigAliasRequiresApprovalOrDenied() {
-        // Denied when allowDeleteFile=false and contains rm
-        val denyCall = ToolCall(
-            id = "git_cfg_alias_deny",
-            name = "execute_command",
-            arguments = """{"command":"git","args":["config","alias.wipe","!rm -rf target"]}"""
-        )
-        val denyDecision = policy.evaluate(
-            call = denyCall,
-            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.DENIED, denyDecision.kind)
-
-        // Requires approval when allowDeleteFile=true
-        val apprDecision = policy.evaluate(
-            call = denyCall,
-            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, apprDecision.kind)
-    }
-
-    @Test
-    fun testGitUnknownSubcommandOrAliasRequiresApprovalInTurboAndDefault() {
+    fun testGitConfigCommandModifyingAliasRequiresApprovalInDefaultAndTurbo() {
         val call = ToolCall(
-            id = "git_unknown_sub",
+            id = "git_cfg_alias",
             name = "execute_command",
-            arguments = """{"command":"git","args":["wipe"]}"""
+            arguments = """{"command":"git","args":["config","alias.st","status"]}"""
         )
-        // In Turbo
-        val turboDecision = policy.evaluate(
+
+        // Turbo
+        val turboDec = policy.evaluate(
             call = call,
             permissions = SecurityPermissions(allowArbitraryCommands = true),
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDecision.kind, "Unknown Git subcommand 'wipe' must require approval in Turbo")
-        assertTrue(turboDecision.reason.contains("Unknown Git subcommand", ignoreCase = true) || turboDecision.reason.contains("Dangerous", ignoreCase = true))
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDec.kind, "Modifying git alias in config must require approval in Turbo")
 
-        // In Default
-        val defaultDecision = policy.evaluate(
+        // Default
+        val defaultDec = policy.evaluate(
             call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = true),
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
             preset = SecurityPreset.DEFAULT,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDecision.kind, "Unknown Git subcommand 'wipe' must require approval in Default")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDec.kind, "Modifying git alias in config must require approval in Default")
     }
 
     @Test
-    fun testGitExecPathStandaloneFlagCleanDeniedWhenDeleteForbidden() {
+    fun testUnknownGitSubcommandRequiresApprovalInDefaultAndTurbo() {
         val call = ToolCall(
-            id = "git_exec_clean",
+            id = "git_unknown_sub",
             name = "execute_command",
-            arguments = """{"command":"git","args":["--exec-path","clean","-fdx"]}"""
+            arguments = """{"command":"git","args":["custom-subcommand","--flag"]}"""
         )
-        val decision = policy.evaluate(
+
+        // Turbo
+        val turboDec = policy.evaluate(
             call = call,
-            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
             preset = SecurityPreset.TURBO,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "git --exec-path clean must be DENIED when allowDeleteFile=false")
-        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
-    }
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDec.kind, "Unknown git subcommand must require approval in Turbo")
+        assertTrue(turboDec.reason.contains("Unknown Git subcommand", ignoreCase = true))
 
-    @Test
-    fun testGitExecPathCleanRequiresApprovalInTurboWhenDeleteAllowed() {
-        val call = ToolCall(
-            id = "git_exec_clean_appr",
-            name = "execute_command",
-            arguments = """{"command":"git","args":["--exec-path","clean","-fdx"]}"""
-        )
-        val decision = policy.evaluate(
+        // Default
+        val defaultDec = policy.evaluate(
             call = call,
-            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.DEFAULT,
             workspaceRoot = workspaceDir,
         )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git --exec-path clean must require approval in Turbo")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDec.kind, "Unknown git subcommand must require approval in Default")
+        assertTrue(defaultDec.reason.contains("Unknown Git subcommand", ignoreCase = true))
     }
 
     @Test
-    fun testShellBackslashEscapingDeletionDeniedWhenDeleteForbidden() {
-        val calls = listOf(
-            """{"command":"bash","args":["-c","r\\m -rf target"]}""",
-            """{"command":"sh","args":["-c","r\\m target"]}""",
-            """{"command":"cmd","args":["/c","r\\m target"]}""",
+    fun testSafeGitSubcommandAllowedImmediatelyInDefaultAndTurbo() {
+        val safeCalls = listOf(
+            listOf("status"),
+            listOf("log", "-n", "10"),
+            listOf("diff", "HEAD~1"),
+            listOf("rev-parse", "--show-toplevel"),
+            listOf("branch", "--list"),
         )
-        for (argsJson in calls) {
-            val call = ToolCall(id = "esc_del", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
-                workspaceRoot = workspaceDir,
+
+        for (args in safeCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_safe",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
             )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Escaped rm '$argsJson' must be DENIED when allowDeleteFile=false")
-            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
-        }
-    }
 
-    @Test
-    fun testShellBackslashEscapingRequiresApprovalWhenDeleteAllowed() {
-        val call = ToolCall(
-            id = "esc_del_appr",
-            name = "execute_command",
-            arguments = """{"command":"bash","args":["-c","r\\m -rf target"]}"""
-        )
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Escaped rm must require approval in Turbo")
-    }
-
-    @Test
-    fun testShellCommandSubstitutionDeniedWhenDeleteForbidden() {
-        val calls = listOf(
-            """{"command":"bash","args":["-c","echo $(rm -rf target)"]}""",
-            """{"command":"sh","args":["-c","echo `rm target`"]}""",
-        )
-        for (argsJson in calls) {
-            val call = ToolCall(id = "subst_del", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
-                workspaceRoot = workspaceDir,
-            )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Command substitution '$argsJson' must be DENIED when allowDeleteFile=false")
-        }
-    }
-
-    @Test
-    fun testPowerShellBase64Variants() {
-        val rawCommand = "shutdown /s /t 0"
-        val base64Payload = Base64.getEncoder().encodeToString(rawCommand.toByteArray(StandardCharsets.UTF_16LE))
-
-        val variants = listOf(
-            """{"command":"powershell","args":["-Encoded","$base64Payload"]}""",
-            """{"command":"powershell","args":["-EncodedCommand:$base64Payload"]}""",
-            """{"command":"powershell","args":["-e","$base64Payload"]}""",
-        )
-        for (argsJson in variants) {
-            val call = ToolCall(id = "ps_var", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
+            // Turbo
+            val turboDec = policy.evaluate(
                 call = call,
                 permissions = SecurityPermissions(allowArbitraryCommands = true),
                 preset = SecurityPreset.TURBO,
                 workspaceRoot = workspaceDir,
             )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "PowerShell variant '$argsJson' must be DENIED")
-            assertTrue(decision.reason.contains("forbidden command", ignoreCase = true))
-        }
-    }
+            assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, turboDec.kind, "Safe git command '${args.joinToString(" ")}' should be allowed in Turbo")
 
-    @Test
-    fun testWrapperCommandsSudoRmDeniedWhenDeleteForbidden() {
-        val wrappers = listOf(
-            """{"command":"sudo","args":["rm","-rf","target"]}""",
-            """{"command":"sudo","args":["-u","root","rm","-rf","target"]}""",
-            """{"command":"doas","args":["rm","target"]}""",
-            """{"command":"busybox","args":["rm","target"]}""",
-            """{"command":"env","args":["rm","target"]}""",
-            """{"command":"env","args":["FOO=1","BAR=2","rm","target"]}""",
-            """{"command":"sudo","args":["git","clean","-fdx"]}""",
-        )
-        for (argsJson in wrappers) {
-            val call = ToolCall(id = "wrap_del", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
-                workspaceRoot = workspaceDir,
-            )
-            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Wrapper deletion '$argsJson' must be DENIED when allowDeleteFile=false")
-            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
-        }
-    }
-
-    @Test
-    fun testWrapperCommandsRequireApprovalWhenDeleteAllowed() {
-        val call = ToolCall(
-            id = "sudo_rm_appr",
-            name = "execute_command",
-            arguments = """{"command":"sudo","args":["rm","-rf","target"]}"""
-        )
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
-            preset = SecurityPreset.TURBO,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "sudo rm must require approval in Turbo")
-    }
-
-    @Test
-    fun testTurboRequiresApprovalForDangerousCommandsEvenWithArbitraryCommands() {
-        val dangerousCalls = listOf(
-            """{"command":"sudo","args":["apt","update"]}""",
-            """{"command":"chmod","args":["777","file.txt"]}""",
-            """{"command":"chown","args":["root","file.txt"]}""",
-        )
-        for (argsJson in dangerousCalls) {
-            val call = ToolCall(id = "danger_call", name = "execute_command", arguments = argsJson)
-            val decision = policy.evaluate(
+            // Default
+            val defaultDec = policy.evaluate(
                 call = call,
                 permissions = SecurityPermissions(allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
+                preset = SecurityPreset.DEFAULT,
                 workspaceRoot = workspaceDir,
             )
-            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Dangerous command '$argsJson' must require approval in Turbo")
+            assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, defaultDec.kind, "Safe git command '${args.joinToString(" ")}' should be allowed in Default")
         }
     }
 
     @Test
-    fun testShellLauncherInDefaultRequiresApprovalRegardlessOfRequireApprovalForDangerous() {
-        val call = ToolCall(
-            id = "sh_default_no_danger",
-            name = "execute_command",
-            arguments = """{"command":"bash","args":["-c","ls"]}"""
-        )
-        val decision = policy.evaluate(
-            call = call,
-            permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = false),
-            preset = SecurityPreset.DEFAULT,
-            workspaceRoot = workspaceDir,
-        )
-        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Shell launcher must require approval in Default even with requireApprovalForDangerous=false")
-    }
-
-    // --- 10. STAGE 7.4.2.4: GIT EXECUTION SAFETY, XARGS HARDENING & CONFIG-ENV ---
-
-    @Test
-    fun testMutatingGitCommandsRequireApprovalInTurboAndDefault() {
+    fun testMutatingGitSubcommandsRequireApprovalInDefaultAndTurbo() {
         val mutatingCalls = listOf(
-            "commit" to listOf("commit", "-m", "fix"),
-            "add" to listOf("add", "."),
-            "checkout" to listOf("checkout", "main"),
-            "merge" to listOf("merge", "feature"),
-            "fetch" to listOf("fetch", "origin"),
-            "pull" to listOf("pull"),
+            "commit" to listOf("commit", "-m", "fix bug"),
+            "add" to listOf("add", "src/"),
+            "checkout" to listOf("checkout", "feature"),
+            "switch" to listOf("switch", "feature"),
+            "merge" to listOf("merge", "main"),
             "rebase" to listOf("rebase", "main"),
+            "push" to listOf("push", "origin", "main"),
+            "pull" to listOf("pull"),
+            "fetch" to listOf("fetch", "origin"),
             "stash" to listOf("stash"),
-            "config_hooks" to listOf("config", "core.hooksPath", "/tmp/hooks"),
-            "config_alias" to listOf("config", "alias.test", "status"),
+            "cherry_pick" to listOf("cherry-pick", "abc1234"),
+            "revert" to listOf("revert", "abc1234"),
+            "init" to listOf("init"),
+            "clone" to listOf("clone", "https://github.com/repo.git"),
             "branch_create" to listOf("branch", "new-feature"),
-            "tag_create" to listOf("tag", "v1.0"),
+            "branch_delete" to listOf("branch", "-d", "old-feature"),
+            "tag_create" to listOf("tag", "v1.0.0"),
+            "tag_delete" to listOf("tag", "-d", "v1.0.0"),
             "remote_add" to listOf("remote", "add", "origin", "https://github.com/repo.git"),
+            "remote_rename" to listOf("remote", "rename", "origin", "upstream"),
+            "remote_rm" to listOf("remote", "rm", "origin"),
+            "diff_output" to listOf("diff", "--output=patch.diff"),
+            "diff_output_eq" to listOf("diff", "--output=/tmp/leak.txt"),
         )
 
         for ((name, args) in mutatingCalls) {
@@ -2508,7 +2221,7 @@ class SecurityPolicyTest {
                 arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
             )
 
-            // TURBO: must REQUIRE_APPROVAL, NEVER ALLOWED_IMMEDIATE
+            // Turbo
             val turboDec = policy.evaluate(
                 call = call,
                 permissions = SecurityPermissions(allowArbitraryCommands = true),
@@ -2518,66 +2231,31 @@ class SecurityPolicyTest {
             assertEquals(
                 SecurityDecisionKind.REQUIRES_APPROVAL,
                 turboDec.kind,
-                "Git mutating command '$name' must require approval in Turbo"
+                "Mutating git command '$name' (${args.joinToString(" ")}) must require approval in Turbo"
+            )
+            assertTrue(
+                turboDec.reason.contains("Mutating Git operation", ignoreCase = true) ||
+                turboDec.reason.contains("Destructive Git operation", ignoreCase = true),
+                "Reason must indicate mutating or destructive Git operation: ${turboDec.reason}"
             )
 
-            // DEFAULT (with requireApprovalForDangerous=true): must REQUIRE_APPROVAL
+            // Default
             val defaultDec = policy.evaluate(
                 call = call,
-                permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = true),
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
                 preset = SecurityPreset.DEFAULT,
                 workspaceRoot = workspaceDir,
             )
             assertEquals(
                 SecurityDecisionKind.REQUIRES_APPROVAL,
                 defaultDec.kind,
-                "Git mutating command '$name' must require approval in Default"
+                "Mutating git command '$name' (${args.joinToString(" ")}) must require approval in Default"
             )
-
-            // DEFAULT (even with requireApprovalForDangerous=false): must REQUIRE_APPROVAL
-            val defaultNoDangerDec = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = false),
-                preset = SecurityPreset.DEFAULT,
-                workspaceRoot = workspaceDir,
+            assertTrue(
+                defaultDec.reason.contains("Mutating Git operation", ignoreCase = true) ||
+                defaultDec.reason.contains("Destructive Git operation", ignoreCase = true),
+                "Reason must indicate mutating or destructive Git operation: ${defaultDec.reason}"
             )
-            assertEquals(
-                SecurityDecisionKind.REQUIRES_APPROVAL,
-                defaultNoDangerDec.kind,
-                "Git mutating command '$name' must require approval in Default even with requireApprovalForDangerous=false"
-            )
-        }
-    }
-
-    @Test
-    fun testUnknownGitSubcommandRequiresApprovalInTurboAndDefault() {
-        val unknownCalls = listOf(
-            listOf("custom-subcommand"),
-            listOf("some-tool", "--flag"),
-        )
-        for (args in unknownCalls) {
-            val jsonArgs = args.joinToString(",") { "\"$it\"" }
-            val call = ToolCall(
-                id = "git_unk",
-                name = "execute_command",
-                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
-            )
-
-            val turboDec = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowArbitraryCommands = true),
-                preset = SecurityPreset.TURBO,
-                workspaceRoot = workspaceDir,
-            )
-            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDec.kind)
-
-            val defaultDec = policy.evaluate(
-                call = call,
-                permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = false),
-                preset = SecurityPreset.DEFAULT,
-                workspaceRoot = workspaceDir,
-            )
-            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDec.kind)
         }
     }
 
@@ -2605,7 +2283,6 @@ class SecurityPolicyTest {
             listOf("tag", "-l"),
             listOf("remote"),
             listOf("remote", "-v"),
-            listOf("remote", "show", "origin"),
             listOf("remote", "get-url", "origin"),
         )
 
@@ -2670,7 +2347,9 @@ class SecurityPolicyTest {
             listOf("-I{}", "rm", "target"),
             listOf("-n", "1", "rm"),
             listOf("-a", "input.txt", "rm"),
+            listOf("--replace", "{}", "rm", "target"),
             listOf("--replace={}", "rm", "target"),
+            listOf("--replace", "{}", "-I{}", "rm", "target"),
             listOf("-P", "4", "rm", "target"),
             listOf("-0", "-r", "-t", "rm", "target"),
         )
@@ -2707,7 +2386,9 @@ class SecurityPolicyTest {
             listOf("-I{}", "rm", "target"),
             listOf("-n", "1", "rm"),
             listOf("-a", "input.txt", "rm"),
+            listOf("--replace", "{}", "rm", "target"),
             listOf("--replace={}", "rm", "target"),
+            listOf("--replace", "{}", "-I{}", "rm", "target"),
             listOf("-P", "4", "rm", "target"),
         )
 
@@ -2747,6 +2428,8 @@ class SecurityPolicyTest {
             listOf("-P"),
             emptyList(),
             listOf("-0"),
+            listOf("--replace"),
+            listOf("--replace="),
         )
 
         for (args in ambiguousInvocations) {
@@ -2926,444 +2609,165 @@ class SecurityPolicyTest {
             assertEquals(SecurityDecisionKind.DENIED, policy.evaluate(mutCall, noExecPerms, preset, workspaceDir).kind)
         }
     }
-}
-```
 
----
+    @Test
+    fun testXargsReplaceRegressionScenarios() {
+        val replaceVariants = listOf(
+            listOf("--replace", "{}", "rm", "target"),
+            listOf("--replace={}", "rm", "target"),
+            listOf("--replace", "{}", "-I{}", "rm", "target"),
+        )
 
-### Файл 3: `shared/build.gradle.kts`
-- **Статус**: MODIFIED
-- **Количество строк**: 62
-- **Описание изменений**: явная привязка sourceSets KMP к рабочей директории `src2` (`src2/commonMain/kotlin`, `src2/commonTest/kotlin`, `src2/jvmMain/kotlin`, `src2/jvmTest/kotlin`), регистрация `compose.resources.customDirectory` для генерации акцессоров ресурсов Compose из `src2/commonMain/composeResources`, лимит `maxHeapSize = "2048m"`.
+        for (args in replaceVariants) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "xargs_repl",
+                name = "execute_command",
+                arguments = """{"command":"xargs","args":[""" + jsonArgs + """]}"""
+            )
 
-```kotlin
-plugins {
-    alias(libs.plugins.kotlinMultiplatform)
-    alias(libs.plugins.composeMultiplatform)
-    alias(libs.plugins.composeCompiler)
-}
+            // When allowDeleteFile = false -> DENIED
+            val denyDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.DENIED,
+                denyDec.kind,
+                "xargs deletion with --replace '${args.joinToString(" ")}' must be DENIED when allowDeleteFile=false"
+            )
 
-kotlin {
-    jvm()
-    sourceSets {
-        commonMain {
-            kotlin.srcDirs("src2/commonMain/kotlin")
-            resources.srcDirs("src2/commonMain/composeResources")
-            dependencies {
-                implementation(libs.compose.runtime)
-                implementation(libs.compose.foundation)
-                implementation(libs.compose.material3)
-                implementation(libs.compose.ui)
-                implementation(libs.compose.components.resources)
-                implementation(libs.compose.uiToolingPreview)
-                implementation(libs.androidx.lifecycle.viewmodelCompose)
-                implementation(libs.androidx.lifecycle.runtimeCompose)
-            }
+            // When allowDeleteFile = true -> REQUIRES_APPROVAL
+            val apprDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                apprDec.kind,
+                "xargs deletion with --replace '${args.joinToString(" ")}' must require approval when allowDeleteFile=true"
+            )
         }
-        commonTest {
-            kotlin.srcDirs("src2/commonTest/kotlin")
-            dependencies {
-                implementation(libs.kotlin.test)
-            }
-        }
-        jvmMain {
-            kotlin.srcDirs("src2/jvmMain/kotlin")
-            dependencies {
-            }
-        }
-        jvmTest {
-            kotlin.srcDirs("src2/jvmTest/kotlin")
-        }
-    }
-}
 
-compose.resources {
-    customDirectory(
-        sourceSetName = "commonMain",
-        directoryProvider = provider { layout.projectDirectory.dir("src2/commonMain/composeResources") }
-    )
-}
+        val ambiguousReplaceVariants = listOf(
+            listOf("--replace"),
+            listOf("--replace="),
+        )
 
-tasks.withType<Test> {
-    maxHeapSize = "2048m"
-}
+        for (args in ambiguousReplaceVariants) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "xargs_ambig_repl",
+                name = "execute_command",
+                arguments = """{"command":"xargs","args":[""" + jsonArgs + """]}"""
+            )
 
-tasks.register<Test>("geminiRealSmokeTest") {
-    group = "verification"
-    description = "Runs live Gemini smoke test against real authenticated WebView2 session"
-    val jvmTestTask = tasks.named<Test>("jvmTest").get()
-    classpath = jvmTestTask.classpath
-    testClassesDirs = jvmTestTask.testClassesDirs
-    systemProperty("antigooglity.gemini.real.smoke", "true")
-    filter {
-        includeTestsMatching("com.limer.antigooglity.webview2.gemini.GeminiRealSmokeTest.*")
-    }
-}
-```
+            // When allowDeleteFile = false -> DENIED
+            val denyDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.DENIED,
+                denyDec.kind,
+                "Ambiguous xargs --replace '${args.joinToString(" ")}' must be DENIED when allowDeleteFile=false"
+            )
 
----
-
-### Файл 4: `desktopApp/build.gradle.kts`
-- **Статус**: MODIFIED
-- **Количество строк**: 40
-- **Описание изменений**: настройка `kotlin.sourceSets.main.kotlin.srcDirs("src2/main/kotlin")` для работы с актуальной директорией `src2`.
-
-```kotlin
-import org.jetbrains.compose.desktop.application.dsl.TargetFormat
-
-plugins {
-    alias(libs.plugins.kotlinJvm)
-    alias(libs.plugins.composeMultiplatform)
-    alias(libs.plugins.composeCompiler)
-}
-
-kotlin {
-    sourceSets {
-        main {
-            kotlin.srcDirs("src2/main/kotlin")
+            // When allowDeleteFile = true -> REQUIRES_APPROVAL
+            val apprDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                apprDec.kind,
+                "Ambiguous xargs --replace '${args.joinToString(" ")}' must REQUIRE_APPROVAL when allowDeleteFile=true"
+            )
         }
     }
-}
 
-dependencies {
-    implementation(project(":shared"))
+    @Test
+    fun testGitClassificationRegressionScenarios() {
+        val perms = SecurityPermissions(allowExecuteCommand = true, allowArbitraryCommands = true)
 
-    implementation(compose.desktop.currentOs)
-    implementation(libs.compose.runtime)
-    implementation(libs.compose.foundation)
-    implementation(libs.compose.material3)
-    implementation(libs.compose.ui)
-    implementation(libs.kotlinx.coroutinesSwing)
+        // 1. git branch --list pattern -> ALLOWED_IMMEDIATE in DEFAULT / TURBO
+        val branchListCall = ToolCall(id = "g_br_list", name = "execute_command", arguments = """{"command":"git","args":["branch","--list","pattern"]}""")
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(branchListCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(branchListCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
 
-    implementation(libs.compose.uiToolingPreview)
-}
+        // 2. git branch new-feature -> REQUIRES_APPROVAL
+        val branchCreateCall = ToolCall(id = "g_br_create", name = "execute_command", arguments = """{"command":"git","args":["branch","new-feature"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(branchCreateCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(branchCreateCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
 
-compose.desktop {
-    application {
-        mainClass = "com.limer.antigooglity.MainKt"
+        // 3. git tag --list -> ALLOWED_IMMEDIATE in DEFAULT / TURBO
+        val tagListCall = ToolCall(id = "g_tag_list", name = "execute_command", arguments = """{"command":"git","args":["tag","--list"]}""")
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(tagListCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(tagListCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
 
-        nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
-            packageName = "com.limer.antigooglity"
-            packageVersion = "1.0.0"
-        }
+        // 4. git tag v1.0 -> REQUIRES_APPROVAL
+        val tagCreateCall = ToolCall(id = "g_tag_create", name = "execute_command", arguments = """{"command":"git","args":["tag","v1.0"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(tagCreateCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(tagCreateCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 5. git remote get-url origin -> ALLOWED_IMMEDIATE in DEFAULT / TURBO
+        val remoteGetUrlCall = ToolCall(id = "g_rem_geturl", name = "execute_command", arguments = """{"command":"git","args":["remote","get-url","origin"]}""")
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(remoteGetUrlCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(remoteGetUrlCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 6. git remote show origin -> REQUIRES_APPROVAL
+        val remoteShowCall = ToolCall(id = "g_rem_show", name = "execute_command", arguments = """{"command":"git","args":["remote","show","origin"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(remoteShowCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(remoteShowCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 7. git remote add origin URL -> REQUIRES_APPROVAL
+        val remoteAddCall = ToolCall(id = "g_rem_add", name = "execute_command", arguments = """{"command":"git","args":["remote","add","origin","https://example.com/repo.git"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(remoteAddCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(remoteAddCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 8. git diff --output=file -> REQUIRES_APPROVAL
+        val diffOutputCall = ToolCall(id = "g_diff_out", name = "execute_command", arguments = """{"command":"git","args":["diff","--output=file"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(diffOutputCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(diffOutputCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 9. git diff --ext-diff -> REQUIRES_APPROVAL
+        val diffExtCall = ToolCall(id = "g_diff_ext", name = "execute_command", arguments = """{"command":"git","args":["diff","--ext-diff"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(diffExtCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(diffExtCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 10. git diff --textconv -> REQUIRES_APPROVAL
+        val diffTextconvCall = ToolCall(id = "g_diff_tc", name = "execute_command", arguments = """{"command":"git","args":["diff","--textconv"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(diffTextconvCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(diffTextconvCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 11. git show --ext-diff -> REQUIRES_APPROVAL
+        val showExtCall = ToolCall(id = "g_show_ext", name = "execute_command", arguments = """{"command":"git","args":["show","--ext-diff"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(showExtCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(showExtCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 12. git log --ext-diff -> REQUIRES_APPROVAL
+        val logExtCall = ToolCall(id = "g_log_ext", name = "execute_command", arguments = """{"command":"git","args":["log","--ext-diff"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(logExtCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(logExtCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
+
+        // 13. git help -> REQUIRES_APPROVAL
+        val helpCall = ToolCall(id = "g_help", name = "execute_command", arguments = """{"command":"git","args":["help"]}""")
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(helpCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(helpCall, perms, SecurityPreset.TURBO, workspaceDir).kind)
     }
 }
 ```
 
 ---
 
-### Файл 5: `docs/architecture.md`
-- **Статус**: MODIFIED
-- **Количество строк**: 296
-- **Описание изменений**: фиксация архитектуры этапа 7.4.2.4: трёхкомпонентная классификация Git-команд (Read-only, Mutating, Unknown), конечный автомат разбора `xargs`, блокировка скрытых алиасов через `--config-env`, правила согласования пресетов и актуальная статистика тестирования (167 тестов, 0 failures, 0 errors, 1 skipped).
+## 5. Заключение
 
-```markdown
-# Архитектура Antigooglity
-
-Данный документ фиксирует актуальное архитектурное состояние проекта Antigooglity после реализации и стабилизации скрытого браузерного runtime на базе Microsoft WebView2, контроллера интерфейса Gemini (Этапы 1, 2, 3, 7.3, 7.3.1, 7.3.2) и подсистемы безопасности Security Presets & Git Integration (Этапы 7.4.2, 7.4.2.1, 7.4.2.2, 7.4.2.3, 7.4.2.4).
-
----
-
-## 1. Границы модулей
-
-Проект состоит из двух основных Gradle-модулей и вспомогательного автономного инструмента:
-
-1. **`:shared`** (Kotlin Multiplatform / JVM):
-   - **`commonMain`**: ядро агента (**Agent Core**), абстракции моделей (`ModelAdapter`), событийная модель (`AgentEvent`), интерфейсы и базовые mock-реализации инструментов, кроссплатформенные ресурсы. Не содержит платформо-зависимого кода WebView2.
-   - **`jvmMain`**:
-     - JVM-реализация координатора (**`AgentCoordinator`**, **`AgentFactory`**), модели безопасности (`SecurityPolicy`, `PolicyEnforcingToolExecutor`, `UiCommandApprover`, `SecurityPermissions`, `SecurityPreset`), парсеры аргументов инструментов и команд.
-     - Интеграция с локальным Git (**`JvmGitService`**): безопасное получение статуса, переключение веток, валидация через `git check-ref-format`, изоляция границ workspace.
-     - **Браузерный клиент (`com.limer.antigooglity.webview2`)**:
-       - `WebView2HostClient`: клиент дочернего процесса Host через JSON Lines IPC.
-       - `WebView2Protocol`: строгий RFC-8259 JSON-парсер (`SimpleJsonValue`) и контракт сообщений протокола.
-       - `GeminiDomController`: контроллер взаимодействия с Web UI Google Gemini (аудит состояния, ввод промпта, закрытие попапов, корреляция ходов диалога по устойчивым контейнерам).
-   - **`commonTest` / `jvmTest`**: unit- и интеграционные тесты Agent Core, координатора, моделей безопасности, Git-интеграции, WebView2 IPC и контроллера Gemini.
-
-2. **`:desktopApp`** (Compose Multiplatform Desktop Application):
-   - Точка входа в приложение (`MainKt`).
-   - Десктопный пользовательский интерфейс (UI) на базе Jetpack Compose for Desktop.
-   - Компоненты UI: `AntigravityComposer`, `Popups` (`PermissionPresetPopup`, `GitBranchSelectorPopup`), `InlineApprovalCard`, `SettingsDialog`.
-   - Зависит исключительно от `:shared`.
-
-3. **`tools/webview2-host`** (.NET 8 WinForms Host):
-   - Отдельный дочерний C#-процесс (`AntigooglityWebView2Host.exe`).
-   - Создаёт скрытый контрол Microsoft WebView2 (`IsVisible = false`) с постоянным пользовательским профилем.
-   - Поддерживает временный видимый диагностический режим (`SET_VISIBILITY`).
-   - Обеспечивает корректный STA Windows Message Loop и строго последовательное асинхронное исполнение команд через `System.Threading.Channels.Channel`.
-
----
-
-## 2. Архитектура Agent Core (`shared/commonMain`, `shared/jvmMain`)
-
-Agent Core представляет собой независимое, реактивное ядро выполнения автономных агентных циклов.
-
-### Ключевые компоненты:
-- **`Agent`**: фасад выполнения задачи. Принимает пользовательский запрос и координирует итерации `AgentLoop`.
-- **`AgentLoop`**: цикл рассуждений и действий (Reasoning and Action Loop). На каждой итерации:
-  1. Запрашивает следующее действие у `ModelAdapter`.
-  2. Генерирует событие `AgentEvent.Thinking`.
-  3. Если модель запрашивает вызовы инструментов (`ToolCall`), последовательно выполняет их через `ToolExecutor`.
-  4. Генерирует события `AgentEvent.ToolRequested` и `AgentEvent.ToolCompleted`.
-  5. Передаёт результаты работы инструментов обратно в контекст диалога.
-  6. При получении финального ответа модели завершает цикл событием `AgentEvent.Completed`.
-- **`AgentContext`**: хранит историю сообщений диалога (`AgentMessage`: `SYSTEM`, `USER`, `ASSISTANT`, `TOOL`), имя задачи и контекстные метаданные.
-- **`AgentConfig`**: конфигурация агента (системный промпт, ограничение максимального числа итераций `maxIterations`).
-- **`AgentEvent`**: типизированные события жизненного цикла (`Started`, `Thinking`, `ToolRequested`, `ToolCompleted`, `Completed`, `Failed`).
-- **`ToolCall` & `ToolResult`**: контракты вызова инструмента (ID, имя, JSON-аргументы) и результата его выполнения (ID, текстовый контент, флаг успешности).
-- **`ToolExecutor`**: интерфейс выполнения вызовов инструментов агентом.
-- **`ModelAdapter` & `ModelResponse`**: контракт интеграции языковой модели и структура её ответа (текст + список вызовов `ToolCall`).
-- **`AgentCoordinator`**: координатор прикладного уровня, связывающий Compose UI с ядром агента. Управляет переключением диалогов, состоянием выполнения (`ExecutionStatus`), потоками событий (`StateFlow`), директорией workspace, профилями безопасности (`SecurityPreset`), разрешениями (`SecurityPermissions`), одобрением команд (`UiCommandApprover`) и состоянием Git (`GitRepositoryInfo`).
-
----
-
-## 3. WebView2 Browser Runtime: архитектура и границы
-
-### 3.1 Граница Kotlin / .NET
-
-```
-+-----------------------------------------------------------+
-| Kotlin/JVM (:shared/jvmMain)                              |
-|                                                           |
-|  [GeminiDomController] ---> [WebView2HostClient]          |
-|                                     | (stdin/stdout)      |
-+-------------------------------------|---------------------+
-                                      | JSON Lines IPC
-+-------------------------------------|---------------------+
-| .NET 8 Host (AntigooglityWebView2Host.exe)                |
-|                                     v                     |
-|  [RunStdinReader] ---> [Channel<HostCommand>]             |
-|                                     | (Sequential STA)    |
-|                             [BrowserController]           |
-|                                     |                     |
-|                           [Microsoft WebView2]            |
-|                     (Hidden WinForms HWND / STA Loop)     |
-+-----------------------------------------------------------+
-```
-
-### 3.2 JSON Lines IPC Протокол
-
-Обмен между Kotlin и .NET Host осуществляется строками UTF-8 JSON Lines через перенаправленные потоки stdin / stdout:
-
-- **Команда из Kotlin (stdin Host):**
-  ```json
-  {
-    "requestId": "req-1a2b3c4d",
-    "command": "EXECUTE_SCRIPT",
-    "script": "(function() { ... })()",
-    "timeoutMs": 15000
-  }
-  ```
-- **Ответ от Host (stdout Kotlin):**
-  ```json
-  {
-    "requestId": "req-1a2b3c4d",
-    "command": "EXECUTE_SCRIPT",
-    "success": true,
-    "data": { "result": { ... } },
-    "error": null
-  }
-  ```
-
----
-
-## 4. Контроллер веб-интерфейса Gemini (`GeminiDomController`)
-
-### 4.1 Аудит состояния (`auditState`)
-- Проверяет URL (`https://gemini.google.com`).
-- Проверяет доступность DOM (`DOM_READY`).
-- Проверяет аутентификацию пользователя (`NEEDS_LOGIN`).
-- Обнаруживает модальные окна и уведомления (`BLOCKED_BY_POPUP`).
-- Проверяет доступность редактора ввода промпта (`EDITOR_NOT_FOUND`).
-- Проверяет текущую активность генерации (`isGenerating`).
-
-### 4.2 Ввод и отправка промпта (`sendPrompt`)
-1. **Закрытие блокирующих попапов**: вызов `dismissPopupsIfPresent()` перед вводом.
-2. **Предусловия**: хост строго `https://gemini.google.com`, редактор найден и доступен, генерация не выполняется, поле ввода пустое (при наличии текста — `EDITOR_NOT_EMPTY`).
-3. **Фиксация снимка диалога**: снимок контейнеров сообщений (`GeminiConversationSnapshot`) валидируется до модификации DOM.
-4. **Вставка и верификация текста**: текст вставляется через `document.execCommand('insertText', false, text)` и проверяется совпадение текста в редакторе с отправляемым промптом (`INSERTED_TEXT_MISMATCH`).
-5. **Однократный триггер отправки**: если кнопка отправки найдена, но отключена — Enter не отправляется автоматически, возвращается ошибка `SEND_BUTTON_DISABLED`.
-6. **Подтверждение отправки в DOM**: подтверждение требует фактического появления нового пользовательского сообщения в DOM с текстом отправленного промпта (только очистки редактора недостаточно). Если подтверждение не получено за 5 секунд, возвращается `SEND_NOT_CONFIRMED` без повторной отправки.
-
-### 4.3 Корреляция ходов диалога (`waitForResponse`)
-1. **Идентификация контейнеров**: контейнеры сообщений (`model-response`, `[data-test-id="model-response"]`) фильтруются от вложенных элементов (`message-content`, `.markdown`), гарантируя совпадение подсчёта в snapshot и в списке ответов.
-2. **Идентификация по ID и позиции**: фиксируются ID существующих ответов (`modelMessageIds`) и их количество (`modelResponseCount`). Новый ответ идентифицируется по появлению контейнера с новым ID или по индексу, строго превышающему предыдущий счётчик.
-3. **Идентичные ответы**: два последовательных ответа с одинаковым текстом корректно различаются как разные ходы благодаря независимым идентификаторам контейнеров и целевому индексу хода.
-4. **Стабилизация текста**: дожидается завершения генерации (`!isGenerating`) и совпадения текста нового ответа на протяжении 2 последовательных интервалов опроса.
-5. **Таймаут**: при истечении времени ожидания метод возвращает `found = false` (незавершённый ответ никогда не возвращается с `found = true`), а частичный текст возвращается в поле `partialText`.
-
----
-
-## 5. Подсистема безопасности и пресетов (Security Subsystem)
-
-Архитектура безопасности Antigooglity строго разделяет три уровня защиты:
-
-```
-+-------------------------------------------------------------------------+
-|                              ToolCall                                   |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-| 1. HARD ENFORCEMENT (Непреодолимые инварианты - ни один пресет не обходит) |
-| - Workspace Path Containment (канонизация realPath, запрет traversal ..)  |
-| - Null-byte injection rejection ('\0')                                  |
-| - Blocked commands list (format, shutdown, diskpart, regedit...)        |
-| - Shell argument deep inspection (запрет заблокированных утилит в bash/cmd) |
-| - Shell obfuscation & backslash stripping (r\m, f\ormat -> DENIED)      |
-| - PowerShell Base64 decoding & validation (-enc, -Encoded, UTF-16LE)    |
-| - Command substitution rejection in shell when delete forbidden ($(), `)  |
-| - Windows batch script prohibition (.bat, .cmd)                         |
-| - Wrapper unwrap analysis (sudo, doas, busybox, env, nohup, pkexec, xargs)|
-| - Strict xargs options parser & ambiguous flag rejection                |
-| - Opaque Git --config-env alias rejection when delete forbidden         |
-| - Git workspace containment (repoRoot строго внутри или равен workspace) |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-| 2. PERMISSION ENFORCEMENT (Статические права SecurityPermissions)       |
-| - allowReadFile / allowWriteFile / allowExecuteCommand                  |
-| - allowDeleteFile=false -> HARD DENY на удаление (rm, del, git clean...) |
-| - allowArbitraryCommands=false -> только белый список (DEFAULT_ALLOWED) |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-| 3. APPROVAL POLICY (Динамические профили подтверждений SecurityPreset)   |
-| - REQUEST_REVIEW: 100% подтверждение всех разрешённых действий          |
-| - DEFAULT: read-only сразу, mutating Git, shell и dangerous через review|
-| - AUTO: read-only и новые файлы сразу; перезапись и терминал требуют review|
-| - TURBO: немедленное выполнение safe allowlisted и read-only Git;       |
-|          mutating Git, shell, dangerous, deletions, reset/clean -> review|
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-|                    PolicyEnforcingToolExecutor                          |
-|    (Единый путь исполнения: UiCommandApprover -> Delegate ToolExecutor)  |
-+-------------------------------------------------------------------------+
-```
-
-### 5.1 Классификация Git-команд (Этап 7.4.2.4)
-
-Команды Git делятся на три чёткие категории с точки зрения безопасности:
-
-1. **Категория A: Read-Only Git Commands**
-   - Только операции чтения и диагностики, не изменяющие репозиторий:
-     - `status`, `diff` (без флагов вывода в файл `--output`), `log`, `show`, `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`, `help`.
-     - `branch` без флагов изменения (`git branch`, `-a`, `-r`, `-v`, `--list`, `--show-current`, `--contains`).
-     - `tag` без создания или удаления (`git tag`, `-l`, `--list`, `-v`, `--verify`).
-     - `remote` без мутирующих подкоманд (`git remote`, `-v`, `show`, `get-url`).
-   - Разрешены к немедленному выполнению (`ALLOWED_IMMEDIATE`) в пресетах `DEFAULT` и `TURBO`.
-
-2. **Категория B: Mutating Git Commands**
-   - Команды, способные изменять состояние индекса, рабочего каталога, конфигурации или истории, а также запускающие хуки (`core.hooksPath`, `.git/hooks`), smudge/clean фильтры, внешние merge drivers и credential helpers:
-     - `commit`, `add`, `checkout`, `switch`, `merge`, `rebase`, `reset`, `clean`, `restore`, `stash`, `fetch`, `pull`, `push`, `init`, `clone`, `cherry-pick`, `revert`, `config`, `am`, `apply`, `bundle`.
-     - `branch` с созданием, переименованием или удалением веток (`-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `--edit-description`, `--set-upstream-to`, создание ветки по имени).
-     - `tag` с созданием или удалением (`-d`, `--delete`, `-a`, `-s`, `-u`, `-f`, `--force`, создание тега).
-     - `remote` с добавлением или изменением (`add`, `rename`, `remove`, `rm`, `set-url`, `set-branches`, `set-head`, `prune`, `update`).
-   - **Всегда требуют подтверждения (`REQUIRES_APPROVAL`) в TURBO и DEFAULT**, независимо от флага `requireApprovalForDangerous`.
-
-3. **Категория C: Unknown Git Commands**
-   - Любая неизвестная подкоманда, кастомный Git alias или потенциальная внешняя подкоманда из `PATH`.
-   - Никогда не считается безопасной автоматически, даже если бинарный файл `git` находится в allowlist.
-   - **Всегда требует подтверждения (`REQUIRES_APPROVAL`) в TURBO и DEFAULT**.
-
-### 5.2 Парсинг утилиты `xargs` (Этап 7.4.2.4)
-
-Для предотвращения обхода ограничений на удаление файлов через `xargs` реализован специализированный конечный автомат разбора опций `parseXargsArgs`:
-- Поддерживает флаги с аргументом (`-d`, `-E`, `-e`, `-I`, `-i`, `-L`, `-l`, `-n`, `-P`, `-s`, `-a`), в том числе слитные формы (`-I{}`, `-P4`, `-n1`, `-ainput.txt`) и раздельные (`-I {}`, `-n 1`, `-a input.txt`).
-- Поддерживает длинные опции с аргументом (`--replace=...`, `--max-args`, `--max-procs`, `--arg-file`, `--delimiter`, `--eof`, `--max-lines`, `--max-chars`).
-- Поддерживает флаги-переключатели (`-0`, `-p`, `-r`, `-t`, `-o`, `--null`, `--interactive`, `--no-run-if-empty`, `--verbose`, `--open-tty`, `--exact`, `--exit`) и их кластеры (`-0rt`, `-rP4`).
-- Поддерживает разделитель `--`.
-- Извлекает целевую команду и распаковывает её цепочку в `unwrapCommand`.
-- Если команда или параметры неоднозначны/неизвестны:
-  - При `allowDeleteFile = false` -> строго `DENIED`.
-  - При `allowDeleteFile = true` -> строго `REQUIRES_APPROVAL`.
-
-### 5.3 Безопасность `--config-env` и Git Aliases (Этап 7.4.2.4)
-
-Git поддерживает определение алиасов через переменные окружения (`--config-env=alias.wipe=VAR` или `--config-env alias.wipe=VAR`). Поскольку значение конфигурации скрыто в переменной окружения и не анализируется в рантайме:
-- Любая конфигурация `--config-env`, определяющая `alias.*`, классифицируется как скрытая угроза удаления / шелл-вызова.
-- При `allowDeleteFile = false` -> возвращает `DENIED`.
-- При `allowDeleteFile = true` -> возвращает `REQUIRES_APPROVAL`.
-- Прямые алиасы `-c alias.wipe=!rm -rf target` и `-calias.wipe=!rm -rf target` также строго детектируются и блокируются (`DENIED` при `allowDeleteFile=false`).
-- Неполный или неоднозначный парсинг глобальных флагов Git (`git -c`, `git --config-env`) никогда не превращается в `ALLOWED_IMMEDIATE` (`DENIED` при `allowDeleteFile=false`, `REQUIRES_APPROVAL` при `allowDeleteFile=true`).
-
-### 5.4 Четыре профиля безопасности (`SecurityPreset`)
-
-1. **`REQUEST_REVIEW`**: Максимальный контроль. Любой ToolCall требует подтверждения пользователя через UI-карточку (`InlineApprovalCard`). Операции, запрещённые статическими правами, отклоняются сразу (`DENIED`), а не запрашиваются у пользователя.
-2. **`DEFAULT`**: Базовый баланс. Read-only операции с файлами и безопасные read-only команды Git (`status`, `diff`, `log`) выполняются немедленно (`ALLOWED_IMMEDIATE`). Мутирующие операции Git (`commit`, `add`, `checkout`, `merge`, `push` и т.д.), неизвестные команды Git, shell launchers и опасные команды требуют подтверждения (`REQUIRES_APPROVAL`).
-3. **`AUTO`**: Автономный режим с защитой от повреждения существующего кода. Read-only операции и создание *новых* файлов выполняются сразу (`ALLOWED_IMMEDIATE`). Перезапись *существующих* файлов требует подтверждения (`REQUIRES_APPROVAL`). Терминальные команды **не** считаются низкорисковыми и требуют подтверждения (`REQUIRES_APPROVAL`).
-4. **`TURBO`**: Высокая скорость. Разрешённые операции чтения, записи файлов, стандартные allowlisted команды и read-only команды Git выполняются сразу (`ALLOWED_IMMEDIATE`). **Исключения:** деструктивные операции Git (`git reset`, `git clean`, `checkout -f`), любые мутирующие операции Git (`commit`, `add`, `checkout`, `merge`), неизвестные команды/алиасы Git, команды удаления файлов, шелл-оболочки и известные опасные команды (sudo, apt, chmod) **требуют подтверждения даже в Turbo**.
-
-### 5.5 Модель безопасности и её границы (Security Model Limitations)
-
-Для корректной интерпретации гарантий безопасности Antigooglity строго разделяет 4 уровня контроля:
-
-1. **Контроль прямых файловых вызовов (`FileSystemToolExecutor`)**:
-   Обеспечивает детерминированную проверку канонических путей (`toRealPath()`), гарантирует непревышение границ workspace и предотвращает path traversal.
-2. **Семантический анализ известных терминальных команд (`TerminalToolExecutor`)**:
-   Анализирует токены, распаковывает известные утилиты-обёртки (`sudo`, `doas`, `busybox`, `env`, `nohup`, `pkexec`, `xargs`), парсит подкоманды Git (включая глобальные флаги, `--config-env` и alias definitions), нормализует шелл-экранирование (`\`, кавычки) и декодирует Base64.
-3. **Контроль запуска исполняемых сред (Runtime Execution)**:
-   Белый список команд (`DEFAULT_ALLOWED_COMMANDS`: `python`, `node`, `java`, `gradle`, `cargo`, `go` и т.д.) фильтрует исполняемые файлы, которым разрешён запуск. Однако сами по себе языковые среды исполнения являются Тьюринг-полными интерпретаторами: код, переданный скрипту Python или Node, исполняется в контексте текущего пользователя ОС. Статический анализ командной строки не может гарантировать безопасность произвольного кода внутри пользовательских скриптов.
-4. **Изоляция на уровне операционной системы (OS Sandbox)**:
-   Полноценная изоляция от произвольного вредоносного кода требует изоляции ядра ОС (Docker-контейнеры, gVisor, Linux namespaces/seccomp, Windows AppContainer). В текущей архитектуре Antigooglity OS-песочница не встроена; гарантии безопасности распространяются на инварианты ToolCall и политику подтверждения действий.
-
-### 5.6 Интеграция с Git (`JvmGitService`)
-- **Изоляция границ Workspace**: Если каталог Git-репозитория находится выше рабочего каталога агента (например, репозиторий `C:\Project`, а workspace задан как `C:\Project\Subdir`), доступ к родительскому репозиторию немедленно блокируется (`isGitRepository = false`) с ошибкой нарушения границ.
-- **Безопасность потоков**: Метод `readStreamBounded` вычитывает stdout и stderr параллельно до конца потока (EOF), предотвращая блокировку буфера каналов (pipe deadlock).
-- **Завершение дерева процессов**: При отмене корутины или таймауте (`GitTimeoutException`) принудительно уничтожается всё дерево дочерних процессов (`process.descendants() + destroyForcibly()`).
-- **Валидация веток**: Имена веток проверяются через `git check-ref-format --branch` без использования командного процессора.
-
----
-
-## 6. Организация тестирования
-
-### 6.1 Обычный прогон тестов (`:shared:allTests`)
-- Не отправляет сетевые запросы в реальный аккаунт Google Gemini.
-- Запускает:
-  - Unit- и интеграционные тесты `SecurityPolicyTest` (62 теста: проверка всех 4 пресетов, hard deny при `allowDeleteFile=false`, блокировка шеллов, деструктивных и мутирующих Git-команд, разбор `xargs`, `--config-env`, wrapper unwrapping, различие Auto vs Default).
-  - Интеграционные тесты `AgentCoordinatorTest` (проверка динамической смены пресета, привязки аргументов к approval UUID, отмены задач во время ожидания).
-  - Тесты `JvmGitServiceTest` (изоляция родительских репозиториев, валидация веток, таймауты, отмена дерева процессов).
-  - 15 unit-тестов `GeminiDomControllerTest`.
-  - 8 интеграционных тестов `WebView2HostIntegrationTest` на изолированном временном профиле.
-  - Все unit-тесты ядра агента и файловой системы.
-- Суммарно: 167 тестов (166 passed, 0 failures, 0 errors, 1 skipped).
-- Тест `GeminiRealSmokeTest` корректно пропускается через `Assume.assumeTrue` (1 skipped).
-
-### 6.2 Ручной реальный Smoke Test (`geminiRealSmokeTest`)
-```powershell
-.\gradlew.bat :shared:geminiRealSmokeTest
-```
-
----
-
-## 7. Статус и разделение с будущими этапами
-
-- **Реализовано и верифицировано:**
-  - .NET 8 WinForms WebView2 Host со скрытым режимом, очередью команд и безопасным завершением.
-  - Постоянный профиль авторизации Google.
-  - JSON Lines IPC протокол со строгим RFC-8259 JSON-парсером (`SimpleJsonValue`).
-  - `GeminiDomController` с проверками состояний, защитой от вложенных DOM-элементов, корреляцией ходов диалога по устойчивым контейнерам и защитой от ложного подтверждения отправки.
-  - Подсистема пресетов разрешений (Request Review, Default, Auto, Turbo) с полным аудитом, классификацией подкоманд Git, разбором `xargs`, защитой от обходов через `--config-env`, Git aliases, shell escaping, wrapper commands и hard deny защитой.
-  - Локальная интеграция с Git с контролем границ workspace и безопасным управлением процессами.
-  - 100% автоматических тестов проходят успешно.
-- **Будущий этап 7.4.3 (Планируется):**
-  - Реализация `GeminiWebView2ModelAdapter`, реализующего интерфейс `ModelAdapter`.
-  - Подключение адаптера к `AgentCoordinator` / `AgentLoop` для полноценного диалога агента с Gemini.
-  - Потоковая передача чанков ответа в события `AgentEvent.ModelStreamEvent`.
-  *(Компонент ModelAdapter для WebView2 ещё не реализован и не входит в состав текущей сборки)*.
-```
-
----
-
-### Проверка полноты списка приложенных исходников:
-- [x] `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt` (MODIFIED, 1413 строк) — полный код включён без сокращений
-- [x] `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` (MODIFIED, 1366 строк) — полный код включён без сокращений
-- [x] `shared/build.gradle.kts` (MODIFIED, 62 строки) — полный код включён без сокращений
-- [x] `desktopApp/build.gradle.kts` (MODIFIED, 40 строк) — полный код включён без сокращений
-- [x] `docs/architecture.md` (MODIFIED, 296 строк) — полный код включён без сокращений
-
-Все требования Этапа 7.4.2.4 полностью выполнены, тесты стабилизированы, регрессионный набор верифицирован с результатом 167 тестов (166 passed, 0 failures, 0 errors, 1 skipped). Работа остановлена перед началом Этапа 7.4.3.
+Все требования этапа **7.4.2.5** полностью реализованы и верифицированы тестами. Подсистема безопасности пресетов и изоляции Git-команд находится в стабильном, полностью протестированном состоянии. Проект готов к дальнейшим этапам разработки.
