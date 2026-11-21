@@ -1,0 +1,3369 @@
+Task `task-1145` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete before proceeding to the next sequential verification task.
+
+Task `task-1213` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
+
+Task `task-1225` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
+
+Task `task-1239` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
+
+Task `task-12
+
+51` has been launched in the background to execute `:shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`. I will wait for it to complete.
+
+Task `task-1257` has been launched in the background to execute `:shared:allTests --rerun-tasks`. I will wait for it to complete.
+
+# Отчёт по этапу 7.4.2.4 — Git Execution Safety & Wrapper Parser Hardening
+
+В рамках этапа 7.4.2.4 выполнен полный аудит и ужесточение политики безопасности `SecurityPolicy`, устранены уязвимости и риски несанкционированного исполнения кода через Git hooks, smudge/clean filters, непрозрачные алиасы через переменные окружения, а также реализован строгий конечный автомат разбора аргументов утилиты `xargs`.
+
+---
+
+## 1. Новая классификация Git-команд
+
+Категория `KNOWN_SAFE_GIT_SUBCOMMANDS` упразднена из-за риска скрытого запуска внешних программ (`core.hooksPath`, `.git/hooks`, smudge/clean filters, merge drivers, credential helpers). Введена строгая модель из трёх взаимоисключающих категорий:
+
+### A. Read-only Git commands (Категория A)
+Операции исключительно чтения и инспекции репозитория, не способные модифицировать индекс, рабочую директорию, историю или конфигурацию:
+- `status`, `diff` (без флагов вывода в файл `--output`), `log`, `show`, `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`, `help`.
+- `branch` без флагов изменения (`git branch`, `-a`, `-r`, `-v`, `--list`, `--show-current`, `--contains`).
+- `tag` без флагов создания/удаления (`git tag`, `-l`, `--list`, `-v`, `--verify`).
+- `remote` без мутирующих подкоманд (`git remote`, `-v`, `show`, `get-url`).
+
+*Поведение*: в режимах `DEFAULT` и `TURBO` разрешены к немедленному выполнению (`ALLOWED_IMMEDIATE`). В `AUTO` и `REQUEST_REVIEW` требуют подтверждения пользователя.
+
+### B. Mutating Git commands (Категория B)
+Команды, способные изменять состояние индекса, рабочего каталога, конфигурации или истории, а также запускающие сторонние хуки и фильтры:
+- `add`, `commit`, `stash`, `checkout`, `switch`, `merge`, `rebase`, `reset`, `clean`, `restore`, `fetch`, `pull`, `push`, `init`, `clone`, `cherry-pick`, `revert`, `config`, `am`, `apply`, `bundle`.
+- `branch` с созданием, переименованием или удалением веток (`-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `--edit-description`, `--set-upstream-to`, создание ветки).
+- `tag` с созданием или удалением (`-d`, `--delete`, `-a`, `-s`, `-u`, `-f`, `--force`, создание тега).
+- `remote` с модификацией конфигурации (`add`, `rename`, `remove`, `rm`, `set-url`, `set-branches`, `set-head`, `prune`, `update`).
+
+*Поведение*: **всегда требуют подтверждения (`REQUIRES_APPROVAL`) во всех режимах**, включая `TURBO` и `DEFAULT` (независимо от значения `requireApprovalForDangerous`). Автоматическое исполнение запрещено.
+
+### C. Unknown Git commands (Категория C)
+Любая неизвестная подкоманда, кастомный Git alias или потенциальная внешняя подкоманда из `PATH`:
+- Не считаются безопасными только потому, что бинарный файл `git` находится в allowlist.
+- **Всегда требуют подтверждения (`REQUIRES_APPROVAL`) во всех режимах**, включая `TURBO` и `DEFAULT`.
+
+---
+
+## 2. Учёт Git hooks, filters и внешних программ
+
+Команды `git commit` (выполняющая `pre-commit`, `commit-msg`, `post-commit`), `git checkout`/`switch` (выполняющие smudge filters), `git add` (clean filters), `git merge` (merge drivers), `git fetch`/`pull` (transport/credential helpers), `git config core.hooksPath` и `git config alias.*` переведены в статус мутирующих/опасных операций. В `TURBO` и `DEFAULT` они никогда не получают `ALLOWED_IMMEDIATE` и всегда требуют явного одобрения пользователя через `InlineApprovalCard`.
+
+---
+
+## 3. Изменённая реализация парсера `xargs`
+
+В функции `unwrapCommand` утилита `xargs` выведена из механизма тривиального пропуска опций. Реализован строгий конечный автомат разбора `parseXargsArgs`:
+- **Флаги с обязательным аргументом**: `-d`, `-E`, `-e`, `-I`, `-i`, `-L`, `-l`, `-n`, `-P`, `-s`, `-a`. Поддерживаются как слитные формы (`-I{}`, `-P4`, `-n1`, `-ainput.txt`), так и раздельные аргументы (`-I {}`, `-n 1`, `-a input.txt`).
+- **Длинные опции**: `--replace=...`, `--max-args=...`, `--max-procs=...`, `--arg-file=...`, `--delimiter=...`, `--eof=...`, `--max-lines=...`, `--max-chars=...`.
+- **Флаги-переключатели (boolean flags)**: `-0`, `-p`, `-r`, `-t`, `-o`, `--null`, `--interactive`, `--no-run-if-empty`, `--verbose`, `--open-tty`, `--exact`, `--exit`. Поддерживаются кластеры коротких флагов (например, `-0rt`, `-rP4`).
+- **Разделитель параметров**: `--`.
+- **Защита от обхода удаления файлов**: извлечённая целевая команда распаковывается рекурсивно. Любые вызовы `rm`, `del`, `git clean` и др. через `xargs` гарантированно обнаруживаются.
+- **Обработка неоднозначностей**: если опция неизвестна, аргумент флага отсутствует или целевая команда не может быть определена однозначно:
+  - При `allowDeleteFile = false` -> строго `DENIED`.
+  - При `allowDeleteFile = true` -> строго `REQUIRES_APPROVAL`.
+
+---
+
+## 4. Обработка `git --config-env` и Aliases
+
+Git поддерживает передачу конфигурации через имя переменной окружения (`--config-env=alias.wipe=WIPE_COMMAND` или `--config-env alias.wipe=WIPE_COMMAND`), скрывая реальный текст команды.
+1. Политика безопасности не считывает произвольные переменные окружения процесса.
+2. Любая конфигурация через `--config-env`, определяющая `alias.*`, классифицируется как скрытая угроза удаления и шелл-инъекции.
+3. При `allowDeleteFile = false` вызов возвращает `DENIED`.
+4. При `allowDeleteFile = true` вызов возвращает `REQUIRES_APPROVAL`.
+5. Аналогично проверяются прямые формы `-c alias.wipe=!rm -rf target` и `-calias.wipe=!rm -rf target`.
+6. Неполные глобальные опции (`git -c`, `git --config-env`) не могут получить `ALLOWED_IMMEDIATE` (`DENIED` при `allowDeleteFile=false`, `REQUIRES_APPROVAL` при `allowDeleteFile=true`).
+
+---
+
+## 5. Полная таблица поведения четырёх пресетов
+
+| Тип операции / Команда | Разрешения | REQUEST_REVIEW | DEFAULT | AUTO | TURBO |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Файл: чтение (`read_file`)** | `allowReadFile=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` |
+| **Файл: чтение (`read_file`)** | `allowReadFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Файл: создание нового** | `allowWriteFile=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` | `ALLOWED_IMMEDIATE` |
+| **Файл: перезапись существующего** | `allowWriteFile=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` |
+| **Файл: прямое удаление (`delete_file`)**| `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Файл: прямое удаление (`delete_file`)**| `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` |
+| **Терминал: `rm target`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Терминал: `rm target`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Терминал: `xargs rm target`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Терминал: `xargs rm target`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Терминал: `xargs --unknown-flag`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Терминал: `xargs --unknown-flag`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Git: Read-Only (`status`, `diff`, `log`)** | `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` | `REQUIRES_APPROVAL` | `ALLOWED_IMMEDIATE` |
+| **Git: Mutating (`commit`, `add`, `checkout`)**| `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Git: Mutating (`commit`, etc., danger=false)**| `reqApprDanger=false` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Git: Unknown subcommand / alias** | `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Git: `--config-env=alias.wipe=VAR`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Git: `--config-env=alias.wipe=VAR`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Git: `-calias.wipe=!rm -rf target`** | `allowDeleteFile=false` | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+| **Git: `-calias.wipe=!rm -rf target`** | `allowDeleteFile=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Shell Launcher (`bash -c`, `powershell`)** | `allowExecuteCommand=true` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` | `REQUIRES_APPROVAL` |
+| **Строго запрещённые (`format`, `shutdown`)**| Любые | **`DENIED`** | **`DENIED`** | **`DENIED`** | **`DENIED`** |
+
+---
+
+## 6. Список новых тестов
+
+В `src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` добавлены регрессионные тесты:
+
+1. `testMutatingGitCommandsRequireApprovalInTurboAndDefault`: проверка `commit`, `add`, `checkout`, `merge`, `fetch`, `pull`, `rebase`, `stash`, `config core.hooksPath`, `config alias.test`, `branch new-feature`, `tag v1.0`, `remote add origin` в режимах TURBO и DEFAULT (включая проверку при `requireApprovalForDangerous=false`).
+2. `testUnknownGitSubcommandRequiresApprovalInTurboAndDefault`: проверка неизвестных подкоманд Git (`custom-subcommand`, `some-tool --flag`) в TURBO и DEFAULT.
+3. `testReadOnlyGitCommandsAllowedImmediatelyInDefaultAndTurbo`: проверка 23 вариантов read-only Git-команд (`status`, `diff`, `log`, `show`, `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`, `branch`, `branch -a/-r/-v/--list/--show-current`, `tag`, `tag -l`, `remote`, `remote -v/show/get-url`) во всех 4 пресетах.
+4. `testXargsRmDeniedWhenAllowDeleteFileIsFalse`: проверка `xargs rm`, `xargs -I{} rm`, `xargs -n 1 rm`, `xargs -a input.txt rm`, `xargs --replace={} rm`, `xargs -P 4 rm`, `xargs -0 -r -t rm` при `allowDeleteFile=false` во всех 4 пресетах.
+5. `testXargsRmRequiresApprovalWhenAllowDeleteFileIsTrue`: проверка `xargs rm` при `allowDeleteFile=true` в TURBO и DEFAULT.
+6. `testXargsAmbiguousOrMalformedOptionsHandling`: проверка неоднозначных и некорректных вызовов `xargs` (`--unknown-flag`, `-Z`, `-P`, пустой `xargs`, `-0` без команды) — возврат `DENIED` при `allowDeleteFile=false` и `REQUIRES_APPROVAL` при `allowDeleteFile=true`.
+7. `testGitConfigEnvAliasVariantsDeniedWhenDeleteForbidden`: проверка `--config-env=alias.wipe=VAR`, `--config-env alias.wipe=VAR`, `-c alias.wipe=!rm -rf target`, `-calias.wipe=!rm -rf target` при `allowDeleteFile=false` во всех 4 пресетах.
+8. `testGitConfigEnvAliasVariantsRequireApprovalWhenDeleteAllowed`: проверка тех же 4 вариантов при `allowDeleteFile=true` в TURBO и DEFAULT.
+9. `testGitAmbiguousGlobalOptionsHandling`: проверка неполных опций `git -c`, `git --config-env`.
+10. `testPresetMatrixAcrossMutatingAndReadOnlyGit`: матричная проверка согласованности всех пресетов и непреодолимости hard deny.
+
+---
+
+## 7. Результаты сборки и XML Test Counts
+
+Все команды сборки и верификации выполнены строго последовательно:
+
+### 1. `.\gradlew.bat :shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks`
+- **Результат**: `BUILD SUCCESSFUL in 9s`
+- **XML**: `TEST-com.limer.antigooglity.coordinator.SecurityPolicyTest.xml`
+  - `tests`: **62**
+  - `failures`: **0**
+  - `errors`: **0**
+  - `skipped`: **0**
+
+### 2. `.\gradlew.bat :shared:allTests --rerun-tasks`
+- **Результат**: `BUILD SUCCESSFUL in 3m 10s`
+- **Детализация по XML отчётам**:
+  - `AgentCoreTest.xml`: tests=7, failures=0, errors=0, skipped=0
+  - `AgentCoordinatorTest.xml`: tests=12, failures=0, errors=0, skipped=0
+  - `SecurityPolicyTest.xml`: tests=62, failures=0, errors=0, skipped=0
+  - `SecurityPreferencesRepositoryTest.xml`: tests=5, failures=0, errors=0, skipped=0
+  - `JvmGitServiceTest.xml`: tests=14, failures=0, errors=0, skipped=0
+  - `CompositeToolExecutorTest.xml`: tests=3, failures=0, errors=0, skipped=0
+  - `FileSystemToolExecutorTest.xml`: tests=16, failures=0, errors=0, skipped=0
+  - `TerminalToolExecutorTest.xml`: tests=24, failures=0, errors=0, skipped=0
+  - `GeminiDomControllerTest.xml`: tests=15, failures=0, errors=0, skipped=0
+  - `WebView2HostIntegrationTest.xml`: tests=8, failures=0, errors=0, skipped=0
+  - `GeminiRealSmokeTest.xml`: tests=1, failures=0, errors=0, skipped=1
+- **Суммарно по проекту**:
+  - **Total Tests**: **167**
+  - **Total Failures**: **0**
+  - **Total Errors**: **0**
+  - **Total Skipped**: **1** (`GeminiRealSmokeTest` пропущен по предусловию отсутствия флага live-сессии)
+
+### 3. `.\gradlew.bat :shared:build :desktopApp:assemble`
+- **Результат**: `BUILD SUCCESSFUL in 1s`
+
+---
+
+## 8. Оставшиеся ограничения модели безопасности
+
+1. **Отсутствие изоляции ядра ОС (Kernel OS Sandboxing)**:
+   Белый список разрешает запуск сред выполнения (`python`, `node`, `java`, `gradle`, `cargo`, `go`). Так как эти среды являются Тьюринг-полными интерпретаторами, скрипты внутри них исполняются в контексте пользователя операционной системы. Гарантии безопасности уровня ОС (cgroups, namespaces, AppContainer, Docker) должны обеспечиваться внешним контейнером.
+2. **Внешние бинарные Git-плагины вне репозитория**:
+   Если в системный `PATH` установлен бинарный файл вида `git-custom`, он корректно классифицируется как `GitCategory.UNKNOWN` и всегда требует подтверждения пользователя (`REQUIRES_APPROVAL`).
+
+---
+
+## 9. Обязательное приложение: полный исходный код изменённых файлов
+
+### Список изменённых файлов:
+1. `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt` (MODIFIED, 1413 строк)
+2. `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` (MODIFIED, 1366 строк)
+3. `shared/build.gradle.kts` (MODIFIED, 62 строки)
+4. `desktopApp/build.gradle.kts` (MODIFIED, 40 строк)
+5. `docs/architecture.md` (MODIFIED, 296 строк)
+
+---
+
+### Файл 1: `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt`
+- **Статус**: MODIFIED
+- **Количество строк**: 1413
+- **Описание изменений**: замена `KNOWN_SAFE_GIT_SUBCOMMANDS` на строгую трёхкомпонентную классификацию `GitCategory` (`READ_ONLY`, `MUTATING`, `UNKNOWN`); расширение `classifyGitSubcommand` с проверкой аргументов `branch`, `tag`, `remote`; реализация специализированного парсера `parseXargsArgs` с поддержкой всех флагов и защитой от неоднозначностей; детектирование скрытых алиасов через `--config-env` и `-c` с возвратом `DENIED` при `allowDeleteFile=false`.
+
+```kotlin
+package com.limer.antigooglity.coordinator
+
+import com.limer.antigooglity.tools.ToolCall
+import com.limer.antigooglity.tools.fs.ToolArgsParser
+import com.limer.antigooglity.tools.fs.WorkspacePathResolver
+import com.limer.antigooglity.tools.terminal.TerminalCommand
+import com.limer.antigooglity.tools.terminal.TerminalConfig
+import com.limer.antigooglity.tools.terminal.TerminalToolExecutor
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.Locale
+
+/**
+ * Deterministic security policy engine evaluating [ToolCall] requests.
+ *
+ * Pipeline: ToolCall -> Security Policy -> Permission Check -> Approval Decision -> Tool Execution
+ *
+ * Security guarantees are divided into three distinct levels:
+ * 1. **Hard Enforcement**: Boundaries that can NEVER be bypassed by any preset or permission
+ *    (Workspace boundary containment, canonical path checks, blocked commands list, null-byte rejection,
+ *    undecodable encoded commands, shell obfuscation, batch script prohibition).
+ * 2. **Permission Enforcement**: Static capability gates defined by [SecurityPermissions]
+ *    (allowReadFile, allowWriteFile, allowDeleteFile, allowExecuteCommand, allowArbitraryCommands).
+ *    Note: when allowDeleteFile=false, file deletion is strictly rejected (DENIED) across all tools and terminals.
+ * 3. **Approval Policy**: Dynamic interaction rules defined by [SecurityPreset]
+ *    (REQUEST_REVIEW, DEFAULT, AUTO, TURBO) determining when user confirmation is required.
+ *
+ * Note on execution model limitations:
+ * The allowlist and argument filters restrict CLI commands, but do NOT provide kernel-level container
+ * isolation. Runtimes capable of arbitrary code execution (Python, Node, Java, Gradle) can perform actions
+ * within the operating system user context. Full OS sandboxing must be provided at the container level.
+ */
+class SecurityPolicy {
+
+    companion object {
+        val FILE_DELETION_COMMANDS: Set<String> = setOf(
+            "rm", "rmdir", "del", "erase", "rd", "remove-item", "ri", "unlink"
+        )
+
+        val DESTRUCTIVE_GIT_SUBCOMMANDS: Set<String> = setOf(
+            "reset", "clean", "restore"
+        )
+
+        val BASE_READ_ONLY_GIT_SUBCOMMANDS: Set<String> = setOf(
+            "status", "diff", "log", "show", "rev-parse", "check-ref-format",
+            "version", "describe", "ls-files", "ls-tree", "shortlog", "help"
+        )
+
+        val MUTATING_GIT_SUBCOMMANDS: Set<String> = setOf(
+            "add", "commit", "stash", "init", "clone", "cherry-pick", "revert",
+            "merge", "rebase", "reset", "clean", "restore", "checkout", "switch",
+            "config", "fetch", "pull", "push", "am", "apply", "bundle"
+        )
+
+        val SHELL_LAUNCHERS: Set<String> = setOf(
+            "cmd", "powershell", "pwsh", "sh", "bash", "zsh", "ksh", "csh"
+        )
+
+        val WRAPPER_COMMANDS: Set<String> = setOf(
+            "sudo", "doas", "busybox", "env", "nohup", "pkexec", "su", "xargs"
+        )
+    }
+
+    enum class GitCategory {
+        READ_ONLY,
+        MUTATING,
+        UNKNOWN
+    }
+
+    data class GitParsedInvocation(
+        val subcommand: String?,
+        val subcommandArgs: List<String>,
+        val configs: List<String>,
+        val definesAlias: Boolean,
+        val aliasDefinesShellOrDeletion: Boolean,
+        val hasOpaqueConfigEnvAlias: Boolean = false,
+        val category: GitCategory = GitCategory.UNKNOWN,
+        val isAmbiguousGlobalOptions: Boolean = false,
+    )
+
+    data class ParsedCommandChain(
+        val effectiveCommand: String,
+        val effectiveNormalized: String,
+        val effectiveArgs: List<String>,
+        val isWrapped: Boolean,
+        val wrappers: List<String>,
+        val isAmbiguousWrapper: Boolean = false,
+    )
+
+    data class XargsParseResult(
+        val target: String?,
+        val targetArgs: List<String>,
+        val isAmbiguous: Boolean,
+    )
+
+    fun evaluate(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        return when (call.name) {
+            "read_file" -> evaluateReadFile(call, permissions, preset, workspaceRoot)
+            "list_directory" -> evaluateListDirectory(call, permissions, preset, workspaceRoot)
+            "write_file" -> evaluateWriteFile(call, permissions, preset, workspaceRoot)
+            "create_directory" -> evaluateCreateDirectory(call, permissions, preset, workspaceRoot)
+            "delete_file" -> evaluateDeleteFile(call, permissions, preset, workspaceRoot)
+            "execute_command" -> evaluateExecuteCommand(call, permissions, preset, workspaceRoot)
+            else -> SecurityDecision(
+                kind = SecurityDecisionKind.UNKNOWNTool,
+                reason = "Unknown tool '${call.name}' is not recognized or supported by security policy",
+            )
+        }
+    }
+
+    private fun evaluateReadFile(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowReadFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Reading files is disabled in security permissions",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "read_file",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for reading file '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO,
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateListDirectory(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowReadFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Reading/listing directory contents is disabled in security permissions",
+            )
+        }
+
+        val pathStr = extractPathArg(call) ?: "."
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "list_directory",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for listing directory '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO,
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateWriteFile(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowWriteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Writing files is disabled in security permissions",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "write_file",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        val fileAlreadyExists = try {
+            val resolver = WorkspacePathResolver(workspaceRoot)
+            val resolved = resolver.resolve(pathStr, mustExist = false)
+            Files.exists(resolved)
+        } catch (_: Exception) {
+            false
+        }
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for writing file '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT -> SecurityDecision(
+                // Preserves baseline agent behavior: file write operations run directly
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+            SecurityPreset.AUTO -> {
+                // Auto mode: overwriting existing file requires review; creating new file is low-risk
+                if (fileAlreadyExists) {
+                    SecurityDecision(
+                        kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                        reason = "Auto mode: overwriting existing file '$pathStr' requires user review",
+                        approvalCommand = approvalCmd,
+                    )
+                } else {
+                    SecurityDecision(
+                        kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+                    )
+                }
+            }
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateCreateDirectory(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowWriteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Creating directories is disabled in security permissions (requires write permission)",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "create_directory",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for creating directory '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO,
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateDeleteFile(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowDeleteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Deleting files is disabled in security permissions (allowDeleteFile=false)",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "delete_file",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW,
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Deleting files is a sensitive operation requiring user confirmation",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateExecuteCommand(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowExecuteCommand) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Executing terminal commands is disabled in security permissions",
+            )
+        }
+
+        val cmd = try {
+            TerminalToolExecutor.parseCommand(call.arguments)
+        } catch (e: Exception) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Invalid command JSON arguments: ${e.message}",
+            )
+        }
+
+        val raw = cmd.command.trim()
+        if (raw.isEmpty()) {
+            return SecurityDecision(SecurityDecisionKind.DENIED, "Command name must not be empty")
+        }
+        if (raw.contains('\u0000')) {
+            return SecurityDecision(SecurityDecisionKind.DENIED, "Null byte detected in command string")
+        }
+
+        // Validate batch scripts on Windows
+        val isWindows = System.getProperty("os.name")?.lowercase(Locale.ROOT)?.contains("win") == true
+        val lowerRaw = raw.lowercase(Locale.ROOT)
+        if (isWindows && (lowerRaw.endsWith(".bat") || lowerRaw.endsWith(".cmd"))) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Execution of Windows batch scripts (.bat, .cmd) is disabled by security policy",
+            )
+        }
+
+        // Validate working directory containment
+        val wdCheck = validatePathBoundary(cmd.workingDirectory, workspaceRoot, mustExist = false)
+        if (wdCheck != null) return wdCheck
+
+        val cmdName = Path.of(raw.replace('\\', '/')).fileName?.toString() ?: raw
+        val normalizedName = if (isWindows) {
+            cmdName.lowercase(Locale.ROOT).removeSuffix(".exe").removeSuffix(".cmd").removeSuffix(".bat")
+        } else {
+            cmdName
+        }
+
+        // Unwrap wrapper commands (sudo, doas, env, busybox, nohup, pkexec, su, xargs)
+        val unwrapped = unwrapCommand(cmdName, normalizedName, cmd.args)
+        val effCmdName = unwrapped.effectiveCommand
+        val effNormalized = unwrapped.effectiveNormalized
+        val effArgs = unwrapped.effectiveArgs
+        val isWrapped = unwrapped.isWrapped
+
+        // 1. Strictly blocked commands (hard boundary in all presets)
+        if (cmdName in TerminalConfig.DEFAULT_BLOCKED_COMMANDS ||
+            normalizedName in TerminalConfig.DEFAULT_BLOCKED_COMMANDS ||
+            effCmdName in TerminalConfig.DEFAULT_BLOCKED_COMMANDS ||
+            effNormalized in TerminalConfig.DEFAULT_BLOCKED_COMMANDS
+        ) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Command '$raw' is strictly forbidden by terminal security policy",
+            )
+        }
+
+        // Ambiguous wrapper invocation (e.g. xargs with unrecognized flags or missing command)
+        if (unwrapped.isAmbiguousWrapper) {
+            if (!permissions.allowDeleteFile) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Ambiguous or unrecognized wrapper arguments cannot be verified safe when allowDeleteFile=false",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Ambiguous wrapper invocation '${cmd.command}' requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // Check if shell launcher arguments contain blocked commands or obfuscations
+        val isShellLauncher = normalizedName in SHELL_LAUNCHERS || effNormalized in SHELL_LAUNCHERS
+        val shellTokens = if (isShellLauncher) {
+            val (shellBlockedDecision, tokens) = inspectShellLauncher(cmd)
+            if (shellBlockedDecision != null) {
+                return shellBlockedDecision
+            }
+            tokens
+        } else {
+            emptySet()
+        }
+
+        // Check command substitution in shell launchers when deletion is disabled
+        if (isShellLauncher && !permissions.allowDeleteFile) {
+            val hasSubstitution = cmd.args.any { it.contains("$(") || it.contains("`") }
+            if (hasSubstitution) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Shell launcher with command substitution cannot be verified safe when allowDeleteFile is disabled",
+                )
+            }
+        }
+
+        // Parse Git arguments if git
+        val isGit = normalizedName == "git" || effNormalized == "git"
+        val parsedGit = if (isGit) {
+            parseGitArgs(if (effNormalized == "git") effArgs else cmd.args)
+        } else {
+            null
+        }
+
+        // Ambiguous or malformed Git global options
+        if (parsedGit != null && parsedGit.isAmbiguousGlobalOptions) {
+            if (!permissions.allowDeleteFile) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Ambiguous or incomplete Git global options cannot be verified safe when allowDeleteFile=false",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Ambiguous Git invocation requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // 2. Check file deletion via terminal (hard boundary when allowDeleteFile=false)
+        val isDeletionCommand = isTerminalDeletionCommand(normalizedName, cmd, shellTokens, parsedGit) ||
+            (isWrapped && isTerminalDeletionCommand(effNormalized, TerminalCommand(effCmdName, effArgs, cmd.workingDirectory), shellTokens, parsedGit))
+
+        if (isDeletionCommand && !permissions.allowDeleteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Deleting files via terminal is disabled in security permissions (allowDeleteFile=false)",
+            )
+        }
+
+        // 3. Check destructive Git operations
+        val isDestructiveGit = if (isGit && parsedGit != null) {
+            isDestructiveGitCommand("git", cmd, parsedGit)
+        } else {
+            false
+        }
+
+        // Categorize Git commands
+        val isMutatingGit = isGit && parsedGit != null && parsedGit.category == GitCategory.MUTATING
+        val isUnknownGit = isGit && parsedGit != null && parsedGit.category == GitCategory.UNKNOWN
+
+        // 4. Check dangerous commands
+        val isDangerous = isDangerousCommand(
+            cmdName = cmdName,
+            normalizedName = normalizedName,
+            cmd = cmd,
+            isDestructiveGit = isDestructiveGit,
+            isDeletion = isDeletionCommand,
+            isWrapped = isWrapped,
+            parsedGit = parsedGit,
+        )
+
+        val isAllowlisted = (cmdName in TerminalConfig.DEFAULT_ALLOWED_COMMANDS ||
+            normalizedName in TerminalConfig.DEFAULT_ALLOWED_COMMANDS) && !isWrapped
+
+        // In Turbo mode:
+        if (preset == SecurityPreset.TURBO) {
+            if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+                )
+            }
+            if (isDestructiveGit) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Destructive Git operation '${cmd.command}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isDeletionCommand) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Terminal file deletion command '${cmd.command}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isShellLauncher) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Shell launcher '${cmd.command}' requires user confirmation in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isMutatingGit) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Mutating Git operation '${cmd.command} ${parsedGit.subcommand}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isUnknownGit) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Unknown Git subcommand or alias '${parsedGit.subcommand}' requires user confirmation in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (parsedGit != null && parsedGit.definesAlias) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Git invocation defining or modifying aliases requires user confirmation in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isDangerous) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Dangerous command '${cmd.command}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            return SecurityDecision(kind = SecurityDecisionKind.ALLOWED_IMMEDIATE)
+        }
+
+        // In Request Review mode: every permitted command requires confirmation
+        if (preset == SecurityPreset.REQUEST_REVIEW) {
+            if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for command '${cmd.command}'",
+                approvalCommand = cmd,
+            )
+        }
+
+        // In Auto mode:
+        // Command execution does not automatically execute; requires confirmation
+        if (preset == SecurityPreset.AUTO) {
+            if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Auto mode: terminal command '${cmd.command}' requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // In Default mode:
+        // Shell launchers ALWAYS require confirmation in Default mode regardless of requireApprovalForDangerous
+        if (isShellLauncher) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Shell launcher '${cmd.command}' requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        // Mutating Git operations, unknown subcommands, and alias definitions ALWAYS require confirmation
+        if (isMutatingGit) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Mutating Git operation '${cmd.command} ${parsedGit.subcommand}' requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (isUnknownGit) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Unknown Git subcommand or alias '${parsedGit.subcommand}' requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (parsedGit != null && parsedGit.definesAlias) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Git invocation defining or modifying aliases requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (isDangerous && permissions.requireApprovalForDangerous) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Command '${cmd.command}' is marked as dangerous and requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // Safe command: check allowlist
+        if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+            )
+        }
+
+        return SecurityDecision(kind = SecurityDecisionKind.ALLOWED_IMMEDIATE)
+    }
+
+    private fun inspectShellLauncher(cmd: TerminalCommand): Pair<SecurityDecision?, Set<String>> {
+        val extractedTokens = mutableSetOf<String>()
+        val textSnippets = mutableListOf<String>()
+
+        var i = 0
+        while (i < cmd.args.size) {
+            val arg = cmd.args[i]
+
+            // Check for PowerShell encoded command flags (-e, -enc, -Encoded, -EncodedCommand, etc.)
+            val encMatch = Regex("^-(?:e|enc|enco|encod|encode|encoded|encodedcommand)(?:[:=](.+))?$", RegexOption.IGNORE_CASE).find(arg)
+            if (encMatch != null) {
+                val inlinePayload = encMatch.groupValues[1]
+                val base64Payload = if (inlinePayload.isNotEmpty()) {
+                    inlinePayload
+                } else if (i + 1 < cmd.args.size) {
+                    i++
+                    cmd.args[i]
+                } else {
+                    null
+                }
+
+                if (base64Payload != null) {
+                    val decodedText = try {
+                        val bytes = java.util.Base64.getDecoder().decode(base64Payload.trim())
+                        // PowerShell uses UTF-16LE for encoded commands
+                        val utf16 = String(bytes, java.nio.charset.StandardCharsets.UTF_16LE).trim()
+                        if (utf16.any { it != '\u0000' && it.isDefined() }) {
+                            utf16
+                        } else {
+                            String(bytes, java.nio.charset.StandardCharsets.UTF_8).trim()
+                        }
+                    } catch (_: Exception) {
+                        return Pair(
+                            SecurityDecision(
+                                kind = SecurityDecisionKind.DENIED,
+                                reason = "Undecodable or invalid encoded shell command argument",
+                            ),
+                            emptySet(),
+                        )
+                    }
+                    textSnippets.add(decodedText)
+                }
+            } else {
+                textSnippets.add(arg)
+            }
+            i++
+        }
+
+        // Collect tokens from raw args and decoded snippets
+        for (snippet in textSnippets) {
+            val lowerSnippet = snippet.lowercase(Locale.ROOT)
+            for (blocked in TerminalConfig.DEFAULT_BLOCKED_COMMANDS) {
+                if (lowerSnippet.contains("\\b$blocked\\b".toRegex()) || lowerSnippet.contains(blocked)) {
+                    return Pair(
+                        SecurityDecision(
+                            kind = SecurityDecisionKind.DENIED,
+                            reason = "Shell launcher argument contains strictly forbidden command: $blocked",
+                        ),
+                        emptySet(),
+                    )
+                }
+            }
+
+            // Check unquoted and unescaped version to defeat obfuscation (e.g. f"o"r"m"a"t, f\ormat, r\m)
+            val unescaped = snippet.replace("\\", "").replace("\"", "").replace("'", "")
+            val unescapedLower = unescaped.lowercase(Locale.ROOT)
+            for (blocked in TerminalConfig.DEFAULT_BLOCKED_COMMANDS) {
+                if (unescapedLower.contains("\\b$blocked\\b".toRegex()) || unescapedLower.contains(blocked)) {
+                    return Pair(
+                        SecurityDecision(
+                            kind = SecurityDecisionKind.DENIED,
+                            reason = "Shell launcher argument contains obfuscated forbidden command: $blocked",
+                        ),
+                        emptySet(),
+                    )
+                }
+            }
+
+            // Split into individual tokens for deletion / subcommand inspection
+            val tokens = unescaped.split(Regex("[\\s;&|`$<>(){}]+"))
+            for (t in tokens) {
+                val clean = t.trim().lowercase(Locale.ROOT)
+                if (clean.isNotEmpty()) {
+                    extractedTokens.add(clean)
+                }
+            }
+        }
+
+        return Pair(null, extractedTokens)
+    }
+
+    private fun parseGitArgs(args: List<String>): GitParsedInvocation {
+        val optionsWithSeparateArg = setOf(
+            "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"
+        )
+        val configs = mutableListOf<String>()
+        var subcmd: String? = null
+        var subArgs = emptyList<String>()
+        var definesAlias = false
+        var aliasDefinesShellOrDeletion = false
+        var hasOpaqueConfigEnvAlias = false
+        var isAmbiguousGlobalOptions = false
+        var hasVersionFlag = false
+        var i = 0
+
+        while (i < args.size) {
+            val arg = args[i]
+
+            // Check --config-env option
+            if (arg == "--config-env") {
+                if (i + 1 < args.size) {
+                    val cfg = args[i + 1]
+                    configs.add(cfg)
+                    val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT)
+                    if (cfgKey.startsWith("alias.") || cfgKey.contains("alias.")) {
+                        definesAlias = true
+                        hasOpaqueConfigEnvAlias = true
+                        aliasDefinesShellOrDeletion = true
+                    }
+                    i += 2
+                    continue
+                } else {
+                    isAmbiguousGlobalOptions = true
+                    break
+                }
+            } else if (arg.startsWith("--config-env=")) {
+                val cfg = arg.substringAfter("=")
+                configs.add(cfg)
+                val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT)
+                if (cfgKey.startsWith("alias.") || cfgKey.contains("alias.")) {
+                    definesAlias = true
+                    hasOpaqueConfigEnvAlias = true
+                    aliasDefinesShellOrDeletion = true
+                }
+                i++
+                continue
+            }
+
+            // Check -c config option
+            if (arg == "-c") {
+                if (i + 1 < args.size) {
+                    configs.add(args[i + 1])
+                    i += 2
+                    continue
+                } else {
+                    isAmbiguousGlobalOptions = true
+                    break
+                }
+            } else if (arg.startsWith("-c") && arg.length > 2 && !arg.startsWith("--")) {
+                configs.add(arg.substring(2))
+                i++
+                continue
+            }
+
+            // Check version flags
+            if (arg == "-v" || arg == "--version") {
+                hasVersionFlag = true
+            }
+
+            // Options taking a separate argument
+            if (arg in optionsWithSeparateArg) {
+                if (i + 1 < args.size) {
+                    i += 2
+                    continue
+                } else {
+                    isAmbiguousGlobalOptions = true
+                    break
+                }
+            }
+
+            // Options with inline argument =
+            if (arg.startsWith("--") && arg.contains("=")) {
+                i++
+                continue
+            }
+
+            // Standalone flags like --no-pager or --exec-path or -p
+            if (arg.startsWith("-")) {
+                i++
+                continue
+            }
+
+            // First non-option token is the subcommand
+            subcmd = arg.lowercase(Locale.ROOT)
+            subArgs = if (i + 1 < args.size) args.subList(i + 1, args.size) else emptyList()
+            break
+        }
+
+        // Analyze configs for alias definitions and dangerous commands
+        for (cfg in configs) {
+            val lowerCfg = cfg.lowercase(Locale.ROOT)
+            if (lowerCfg.contains("alias.") || lowerCfg.startsWith("alias")) {
+                definesAlias = true
+                val valPart = cfg.substringAfter("=", "")
+                if (valPart.startsWith("!") || valPart.contains("!") ||
+                    FILE_DELETION_COMMANDS.any { del -> valPart.contains("\\b$del\\b".toRegex()) || valPart.contains(del) } ||
+                    TerminalConfig.DEFAULT_BLOCKED_COMMANDS.any { b -> valPart.contains(b) }
+                ) {
+                    aliasDefinesShellOrDeletion = true
+                }
+            }
+        }
+
+        // Also check if subcommand is "config" and modifies an alias
+        if (subcmd == "config") {
+            val fullConfigArgs = subArgs.joinToString(" ").lowercase(Locale.ROOT)
+            if (fullConfigArgs.contains("alias.") || fullConfigArgs.contains("alias ")) {
+                definesAlias = true
+                if (fullConfigArgs.contains("!") ||
+                    FILE_DELETION_COMMANDS.any { del -> fullConfigArgs.contains("\\b$del\\b".toRegex()) || fullConfigArgs.contains(del) } ||
+                    TerminalConfig.DEFAULT_BLOCKED_COMMANDS.any { b -> fullConfigArgs.contains(b) }
+                ) {
+                    aliasDefinesShellOrDeletion = true
+                }
+            }
+        }
+
+        val category = classifyGitSubcommand(subcmd, subArgs, hasVersionFlag)
+
+        return GitParsedInvocation(
+            subcommand = subcmd,
+            subcommandArgs = subArgs,
+            configs = configs,
+            definesAlias = definesAlias,
+            aliasDefinesShellOrDeletion = aliasDefinesShellOrDeletion,
+            hasOpaqueConfigEnvAlias = hasOpaqueConfigEnvAlias,
+            category = category,
+            isAmbiguousGlobalOptions = isAmbiguousGlobalOptions,
+        )
+    }
+
+    private fun classifyGitSubcommand(
+        subcmd: String?,
+        subArgs: List<String>,
+        hasVersionFlag: Boolean = false,
+    ): GitCategory {
+        if (subcmd == null) {
+            return if (hasVersionFlag) GitCategory.READ_ONLY else GitCategory.UNKNOWN
+        }
+
+        if (subcmd in BASE_READ_ONLY_GIT_SUBCOMMANDS) {
+            // Check if diff writes to output file
+            if (subcmd == "diff" && subArgs.any { it.startsWith("--output") }) {
+                return GitCategory.MUTATING
+            }
+            return GitCategory.READ_ONLY
+        }
+
+        if (subcmd == "branch") {
+            val mutatingBranchFlags = setOf(
+                "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+                "--edit-description", "--set-upstream-to", "-u", "--unset-upstream"
+            )
+            if (subArgs.any { it in mutatingBranchFlags || mutatingBranchFlags.any { f -> it.startsWith("$f=") } }) {
+                return GitCategory.MUTATING
+            }
+
+            val listFlagsWithArg = setOf(
+                "--contains", "--no-contains", "--merged", "--no-merged", "--sort", "--format", "--points-at"
+            )
+            val listStandaloneFlags = setOf(
+                "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "-l", "--list",
+                "--show-current", "-i", "--ignore-case", "-q", "--quiet", "--no-color", "--color",
+                "--column", "--no-column"
+            )
+            val hasListFlag = subArgs.any { it == "-l" || it == "--list" }
+
+            var i = 0
+            while (i < subArgs.size) {
+                val a = subArgs[i]
+                if (a in listStandaloneFlags) {
+                    i++
+                    continue
+                }
+                if (a in listFlagsWithArg) {
+                    i += 2
+                    continue
+                }
+                if (listFlagsWithArg.any { f -> a.startsWith("$f=") }) {
+                    i++
+                    continue
+                }
+                if (!a.startsWith("-")) {
+                    // If listing flag is present, positional arg is a pattern; otherwise it is a branch to create/modify
+                    if (hasListFlag) {
+                        i++
+                        continue
+                    }
+                    return GitCategory.MUTATING
+                }
+                return GitCategory.MUTATING
+            }
+            return GitCategory.READ_ONLY
+        }
+
+        if (subcmd == "tag") {
+            val mutatingTagFlags = setOf(
+                "-d", "--delete", "-a", "-s", "-u", "-f", "--force", "-m", "-F"
+            )
+            if (subArgs.any { it in mutatingTagFlags || mutatingTagFlags.any { f -> it.startsWith("$f=") } }) {
+                return GitCategory.MUTATING
+            }
+
+            val listTagFlagsWithArg = setOf(
+                "-n", "--sort", "--contains", "--no-contains", "--points-at", "--format"
+            )
+            val listTagStandaloneFlags = setOf(
+                "-l", "--list", "-v", "--verify", "-i", "--ignore-case", "--column", "--no-column"
+            )
+            val hasListFlag = subArgs.any { it == "-l" || it == "--list" }
+            val hasVerifyFlag = subArgs.any { it == "-v" || it == "--verify" }
+
+            var i = 0
+            while (i < subArgs.size) {
+                val a = subArgs[i]
+                if (a in listTagStandaloneFlags) {
+                    i++
+                    continue
+                }
+                if (a in listTagFlagsWithArg) {
+                    i += 2
+                    continue
+                }
+                if (listTagFlagsWithArg.any { f -> a.startsWith("$f=") } || a.startsWith("-n")) {
+                    i++
+                    continue
+                }
+                if (!a.startsWith("-")) {
+                    if (hasListFlag || hasVerifyFlag) {
+                        i++
+                        continue
+                    }
+                    // Positional argument without list/verify: creating a tag!
+                    return GitCategory.MUTATING
+                }
+                return GitCategory.MUTATING
+            }
+            return GitCategory.READ_ONLY
+        }
+
+        if (subcmd == "remote") {
+            val mutatingRemoteSubs = setOf(
+                "add", "rename", "remove", "rm", "set-head", "set-branches", "set-url", "prune", "update"
+            )
+            val readOnlyRemoteSubs = setOf(
+                "show", "get-url"
+            )
+            val nonFlagArgs = subArgs.filter { !it.startsWith("-") }
+            if (nonFlagArgs.isEmpty()) {
+                return GitCategory.READ_ONLY
+            }
+            val remoteSub = nonFlagArgs[0].lowercase(Locale.ROOT)
+            if (remoteSub in mutatingRemoteSubs) {
+                return GitCategory.MUTATING
+            }
+            if (remoteSub in readOnlyRemoteSubs) {
+                return GitCategory.READ_ONLY
+            }
+            return GitCategory.MUTATING
+        }
+
+        if (subcmd in MUTATING_GIT_SUBCOMMANDS) {
+            return GitCategory.MUTATING
+        }
+
+        return GitCategory.UNKNOWN
+    }
+
+    private fun parseXargsArgs(args: List<String>): XargsParseResult {
+        if (args.isEmpty()) {
+            return XargsParseResult(target = null, targetArgs = emptyList(), isAmbiguous = true)
+        }
+
+        val longOptsWithArg = setOf(
+            "--max-args", "--max-procs", "--arg-file", "--delimiter", "--eof", "--max-lines", "--max-chars"
+        )
+        val standaloneLongOpts = setOf(
+            "--null", "--interactive", "--no-run-if-empty", "--verbose", "--open-tty", "--exact", "--exit"
+        )
+        val standaloneShortOpts = setOf('0', 'p', 'r', 't', 'o', 'x')
+        val shortOptsWithArg = setOf('d', 'E', 'e', 'I', 'i', 'L', 'l', 'n', 'P', 's', 'a')
+
+        var i = 0
+        var isAmbiguous = false
+
+        while (i < args.size) {
+            val arg = args[i]
+
+            // End of options marker
+            if (arg == "--") {
+                i++
+                break
+            }
+
+            // Long options
+            if (arg.startsWith("--")) {
+                if (arg.startsWith("--replace=")) {
+                    i++
+                    continue
+                }
+                if (arg == "--replace") {
+                    i++
+                    continue
+                }
+                if (arg.contains("=")) {
+                    val optName = arg.substringBefore("=")
+                    if (optName in longOptsWithArg) {
+                        i++
+                        continue
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                if (arg in standaloneLongOpts) {
+                    i++
+                    continue
+                }
+                if (arg in longOptsWithArg) {
+                    if (i + 1 < args.size) {
+                        i += 2
+                        continue
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                isAmbiguous = true
+                break
+            }
+
+            // Short options
+            if (arg.startsWith("-") && arg.length > 1) {
+                var c = 1
+                while (c < arg.length) {
+                    val ch = arg[c]
+                    if (ch in standaloneShortOpts) {
+                        c++
+                    } else if (ch in shortOptsWithArg) {
+                        val rest = arg.substring(c + 1)
+                        if (rest.isNotEmpty()) {
+                            // Value is embedded in same argument: e.g. -I{}, -P4, -n1
+                            c = arg.length
+                        } else {
+                            if (ch == 'i' || ch == 'e') {
+                                // -i and -e can be standalone in POSIX/GNU xargs
+                                c = arg.length
+                            } else {
+                                if (i + 1 < args.size) {
+                                    i++
+                                    c = arg.length
+                                } else {
+                                    isAmbiguous = true
+                                    break
+                                }
+                            }
+                        }
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                if (isAmbiguous) break
+                i++
+                continue
+            }
+
+            // First non-option token is the target command
+            break
+        }
+
+        if (isAmbiguous) {
+            return XargsParseResult(target = null, targetArgs = emptyList(), isAmbiguous = true)
+        }
+
+        if (i < args.size) {
+            val target = args[i]
+            val targetArgs = if (i + 1 < args.size) args.subList(i + 1, args.size) else emptyList()
+            return XargsParseResult(target = target, targetArgs = targetArgs, isAmbiguous = false)
+        }
+
+        // xargs without command defaults to echo, but cannot be verified safe
+        return XargsParseResult(target = null, targetArgs = emptyList(), isAmbiguous = true)
+    }
+
+    private fun unwrapCommand(rawCommand: String, normalizedName: String, args: List<String>): ParsedCommandChain {
+        var curCommand = rawCommand
+        var curNormalized = normalizedName
+        var curArgs = args
+        val wrappers = mutableListOf<String>()
+        var isAmbiguousWrapper = false
+
+        while (curNormalized in WRAPPER_COMMANDS) {
+            wrappers.add(curNormalized)
+            if (curNormalized == "xargs") {
+                val parsedXargs = parseXargsArgs(curArgs)
+                if (parsedXargs.isAmbiguous || parsedXargs.target == null) {
+                    isAmbiguousWrapper = true
+                    break
+                }
+                curCommand = parsedXargs.target
+                curArgs = parsedXargs.targetArgs
+                val isWin = System.getProperty("os.name")?.lowercase(Locale.ROOT)?.contains("win") == true
+                val name = Path.of(curCommand.replace('\\', '/')).fileName?.toString() ?: curCommand
+                curNormalized = if (isWin) {
+                    name.lowercase(Locale.ROOT).removeSuffix(".exe").removeSuffix(".cmd").removeSuffix(".bat")
+                } else {
+                    name.lowercase(Locale.ROOT)
+                }
+                continue
+            }
+
+            val next = findWrappedTarget(curNormalized, curArgs)
+            if (next == null) {
+                isAmbiguousWrapper = true
+                break
+            }
+            curCommand = next.first
+            curArgs = next.second
+            val isWin = System.getProperty("os.name")?.lowercase(Locale.ROOT)?.contains("win") == true
+            val name = Path.of(curCommand.replace('\\', '/')).fileName?.toString() ?: curCommand
+            curNormalized = if (isWin) {
+                name.lowercase(Locale.ROOT).removeSuffix(".exe").removeSuffix(".cmd").removeSuffix(".bat")
+            } else {
+                name.lowercase(Locale.ROOT)
+            }
+        }
+
+        return ParsedCommandChain(
+            effectiveCommand = curCommand,
+            effectiveNormalized = curNormalized,
+            effectiveArgs = curArgs,
+            isWrapped = wrappers.isNotEmpty(),
+            wrappers = wrappers,
+            isAmbiguousWrapper = isAmbiguousWrapper,
+        )
+    }
+
+    private fun findWrappedTarget(wrapper: String, args: List<String>): Pair<String, List<String>>? {
+        if (args.isEmpty()) return null
+        var i = 0
+
+        when (wrapper) {
+            "xargs" -> {
+                val parsed = parseXargsArgs(args)
+                if (parsed.isAmbiguous || parsed.target == null) {
+                    return null
+                }
+                return Pair(parsed.target, parsed.targetArgs)
+            }
+            "sudo", "doas", "pkexec" -> {
+                val optsWithArg = setOf("-u", "-g", "-p", "-c", "-C", "-r", "-t", "--user")
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a == "--") {
+                        i++
+                        break
+                    }
+                    if (a in optsWithArg) {
+                        i += 2
+                        continue
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "env" -> {
+                val optsWithArg = setOf("-u", "-C")
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a == "--") {
+                        i++
+                        break
+                    }
+                    if (a in optsWithArg) {
+                        i += 2
+                        continue
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    // Skip VAR=val environment assignments
+                    if (a.contains("=") && !a.startsWith("=")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "busybox" -> {
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "nohup" -> {
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a == "--") {
+                        i++
+                        break
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "su" -> {
+                val optsWithArg = setOf("-c", "-s")
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a in optsWithArg) {
+                        if (a == "-c" && i + 1 < args.size) {
+                            val cmdString = args[i + 1]
+                            val parts = cmdString.trim().split(Regex("\\s+"))
+                            if (parts.isNotEmpty()) {
+                                return Pair(parts[0], parts.drop(1))
+                            }
+                        }
+                        i += 2
+                        continue
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    // username
+                    i++
+                    break
+                }
+            }
+            else -> {
+                while (i < args.size && args[i].startsWith("-")) {
+                    i++
+                }
+            }
+        }
+
+        if (i < args.size) {
+            val target = args[i]
+            val targetArgs = if (i + 1 < args.size) args.subList(i + 1, args.size) else emptyList()
+            return Pair(target, targetArgs)
+        }
+        return null
+    }
+
+    private fun isTerminalDeletionCommand(
+        normalizedName: String,
+        cmd: TerminalCommand,
+        shellTokens: Set<String> = emptySet(),
+        parsedGit: GitParsedInvocation? = null,
+    ): Boolean {
+        if (normalizedName in FILE_DELETION_COMMANDS) return true
+        if (normalizedName == "git") {
+            val git = parsedGit ?: parseGitArgs(cmd.args)
+            if (git.subcommand == "clean") return true
+            if (git.aliasDefinesShellOrDeletion) return true
+            if (git.hasOpaqueConfigEnvAlias) return true
+        }
+        if (normalizedName in SHELL_LAUNCHERS) {
+            if (FILE_DELETION_COMMANDS.any { it in shellTokens }) {
+                return true
+            }
+            val fullArgs = cmd.args.joinToString(" ").lowercase(Locale.ROOT)
+            if (FILE_DELETION_COMMANDS.any { del -> fullArgs.contains("\\b$del\\b".toRegex()) || fullArgs.contains(del) }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isDestructiveGitCommand(
+        normalizedName: String,
+        cmd: TerminalCommand,
+        parsedGit: GitParsedInvocation = parseGitArgs(cmd.args),
+    ): Boolean {
+        if (normalizedName != "git") return false
+        val subcmd = parsedGit.subcommand ?: return false
+        if (subcmd in DESTRUCTIVE_GIT_SUBCOMMANDS) return true
+        if (subcmd == "checkout") {
+            if (parsedGit.subcommandArgs.any { it == "-f" || it == "--force" || it == "-B" || it == "--discard-changes" }) return true
+        }
+        if (subcmd == "switch") {
+            if (parsedGit.subcommandArgs.any { it == "-f" || it == "--force" || it == "-C" || it == "--discard-changes" }) return true
+        }
+        if (subcmd == "branch") {
+            val hasDelete = parsedGit.subcommandArgs.any { it == "-D" || it == "-d" || it == "--delete" }
+            val hasForce = parsedGit.subcommandArgs.any { it == "-D" || it == "-f" || it == "--force" }
+            if (parsedGit.subcommandArgs.any { it == "-D" } || (hasDelete && hasForce)) return true
+        }
+        return false
+    }
+
+    private fun isDangerousCommand(
+        cmdName: String,
+        normalizedName: String,
+        cmd: TerminalCommand,
+        isDestructiveGit: Boolean,
+        isDeletion: Boolean,
+        isWrapped: Boolean,
+        parsedGit: GitParsedInvocation?,
+    ): Boolean {
+        if (isWrapped) return true
+        if (cmdName in TerminalConfig.DEFAULT_DANGEROUS_COMMANDS || normalizedName in TerminalConfig.DEFAULT_DANGEROUS_COMMANDS) {
+            return true
+        }
+        if (normalizedName in SHELL_LAUNCHERS) {
+            return true
+        }
+        if (isDestructiveGit) {
+            return true
+        }
+        if (isDeletion) {
+            return true
+        }
+        if (normalizedName == "git" && parsedGit != null) {
+            if (parsedGit.definesAlias) return true
+            if (parsedGit.hasOpaqueConfigEnvAlias) return true
+            if (parsedGit.category == GitCategory.MUTATING || parsedGit.category == GitCategory.UNKNOWN) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun extractPathArg(call: ToolCall): String? {
+        return try {
+            val args = ToolArgsParser.parseObject(call.arguments)
+            args["path"] ?: args["filename"] ?: args["file"] ?: args["dir"] ?: args["directory"]
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun validatePathBoundary(
+        pathStr: String,
+        workspaceRoot: Path,
+        mustExist: Boolean,
+    ): SecurityDecision? {
+        if (pathStr.contains('\u0000')) {
+            return SecurityDecision(SecurityDecisionKind.DENIED, "Null byte detected in path string")
+        }
+        val resolver = WorkspacePathResolver(workspaceRoot)
+        return try {
+            resolver.resolve(pathStr, mustExist = mustExist)
+            null
+        } catch (e: SecurityException) {
+            SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Path boundary violation: ${e.message}",
+            )
+        } catch (e: Exception) {
+            SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Invalid path '$pathStr': ${e.message}",
+            )
+        }
+    }
+}
+```
+
+---
+
+### Файл 2: `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt`
+- **Статус**: MODIFIED
+- **Количество строк**: 1366
+- **Описание изменений**: сохранение всех 52 существующих тестов без удаления или ослабления; добавление 10 новых регрессионных тестовых методов (с 53 по 62), проверяющих: блокировку мутирующих Git-команд в TURBO и DEFAULT, проверку неизвестных подкоманд/алиасов Git, немедленное исполнение read-only Git-команд, разбор всех форм аргументов `xargs`, блокировку `xargs rm` при `allowDeleteFile=false`, обработку неоднозначных вызовов `xargs`, блокировку и запрос подтверждений для `--config-env`, `-c` и `-calias`, а также полную матрицу пресетов.
+
+```kotlin
+package com.limer.antigooglity.coordinator
+
+import com.limer.antigooglity.tools.ToolCall
+import com.limer.antigooglity.tools.mock.MockToolExecutor
+import com.limer.antigooglity.tools.terminal.TerminalCommand
+import kotlinx.coroutines.runBlocking
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.Base64
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+
+class SecurityPolicyTest {
+
+    private lateinit var workspaceDir: Path
+    private val policy = SecurityPolicy()
+
+    @BeforeTest
+    fun setUp() {
+        workspaceDir = Files.createTempDirectory("antigooglity-policy-test-").toRealPath()
+        Files.writeString(workspaceDir.resolve("sample.txt"), "sample content")
+    }
+
+    @AfterTest
+    fun tearDown() {
+        workspaceDir.toFile().deleteRecursively()
+    }
+
+    // --- 1. REQUEST REVIEW ---
+
+    @Test
+    fun testRequestReviewRequiresApprovalForReadFile() {
+        val call = ToolCall(id = "1", name = "read_file", arguments = """{"path":"sample.txt"}""")
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowReadFile = true),
+            preset = SecurityPreset.REQUEST_REVIEW,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind)
+        assertTrue(decision.requiresApproval)
+    }
+
+    @Test
+    fun testRequestReviewRequiresApprovalForWriteFile() {
+        val call = ToolCall(id = "2", name = "write_file", arguments = """{"path":"out.txt","content":"hello"}""")
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowWriteFile = true),
+            preset = SecurityPreset.REQUEST_REVIEW,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind)
+    }
+
+    @Test
+    fun testRequestReviewRequiresApprovalForSafeCommand() {
+        val call = ToolCall(id = "3", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowExecuteCommand = true),
+            preset = SecurityPreset.REQUEST_REVIEW,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind)
+    }
+
+    @Test
+    fun testRequestReviewDeniesForbiddenActionWithoutApproval() {
+        // If reading files is disabled, it should be DENIED directly, NOT offered for approval!
+        val call = ToolCall(id = "4", name = "read_file", arguments = """{"path":"sample.txt"}""")
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowReadFile = false),
+            preset = SecurityPreset.REQUEST_REVIEW,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+        assertTrue(decision.isDenied)
+    }
+
+    // --- 2. DEFAULT VS AUTO DISTINCTION ---
+
+    @Test
+    fun testDefaultAllowsSafeFileOperationsImmediately() {
+        val readCall = ToolCall(id = "5", name = "read_file", arguments = """{"path":"sample.txt"}""")
+        val writeCall = ToolCall(id = "6", name = "write_file", arguments = """{"path":"out.txt","content":"ok"}""")
+        val listCall = ToolCall(id = "7", name = "list_directory", arguments = """{"path":"."}""")
+
+        val perms = SecurityPermissions()
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(readCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(writeCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(listCall, perms, SecurityPreset.DEFAULT, workspaceDir).kind)
+    }
+
+    @Test
+    fun testDefaultPreservesBaselineWritingToExistingFileImmediately() {
+        // sample.txt exists
+        val call = ToolCall(id = "d_write", name = "write_file", arguments = """{"path":"sample.txt","content":"overwritten"}""")
+        val decision = policy.evaluate(call, SecurityPermissions(), SecurityPreset.DEFAULT, workspaceDir)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, decision.kind, "Default should allow writing to existing file immediately")
+    }
+
+    @Test
+    fun testDefaultAllowsSafeAllowlistedCommandsImmediately() {
+        val gitCall = ToolCall(
+            id = "9",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["status"]}"""
+        )
+        val decision = policy.evaluate(
+            call = gitCall,
+            permissions = SecurityPermissions(allowExecuteCommand = true),
+            preset = SecurityPreset.DEFAULT,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, decision.kind)
+    }
+
+    @Test
+    fun testDefaultRequiresApprovalForDangerousCommands() {
+        val dangerCall = ToolCall(
+            id = "8",
+            name = "execute_command",
+            arguments = """{"command":"rm","args":["--help"]}"""
+        )
+        val decision = policy.evaluate(
+            call = dangerCall,
+            permissions = SecurityPermissions(
+                allowExecuteCommand = true,
+                allowDeleteFile = true,
+                requireApprovalForDangerous = true,
+            ),
+            preset = SecurityPreset.DEFAULT,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind)
+    }
+
+    @Test
+    fun testAutoRequiresApprovalForWritingToExistingFile() {
+        // In AUTO: modifying/overwriting existing file requires approval
+        val overwriteCall = ToolCall(id = "a_ovr", name = "write_file", arguments = """{"path":"sample.txt","content":"overwritten"}""")
+        val decision = policy.evaluate(overwriteCall, SecurityPermissions(), SecurityPreset.AUTO, workspaceDir)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind)
+        assertTrue(decision.reason.contains("overwriting existing file", ignoreCase = true))
+    }
+
+    @Test
+    fun testAutoAllowsWritingToNewFileImmediately() {
+        // In AUTO: creating new file is low-risk and allowed immediately
+        val newCall = ToolCall(id = "a_new", name = "write_file", arguments = """{"path":"brand_new_file.txt","content":"brand new"}""")
+        val decision = policy.evaluate(newCall, SecurityPermissions(), SecurityPreset.AUTO, workspaceDir)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, decision.kind)
+    }
+
+    @Test
+    fun testAutoRequiresApprovalForTerminalCommandsEvenIfSafeAndAllowlisted() {
+        // In AUTO: commands are not considered low-risk, so all commands require approval
+        val gitCall = ToolCall(id = "a_cmd", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
+        val decision = policy.evaluate(gitCall, SecurityPermissions(), SecurityPreset.AUTO, workspaceDir)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind)
+        assertTrue(decision.reason.contains("Auto mode: terminal command", ignoreCase = true))
+    }
+
+    @Test
+    fun testAutoAllowsReadOnlyOperationsImmediately() {
+        val readCall = ToolCall(id = "10", name = "read_file", arguments = """{"path":"sample.txt"}""")
+        val listCall = ToolCall(id = "11", name = "list_directory", arguments = """{"path":"."}""")
+        val perms = SecurityPermissions(allowReadFile = true)
+
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(readCall, perms, SecurityPreset.AUTO, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(listCall, perms, SecurityPreset.AUTO, workspaceDir).kind)
+    }
+
+    // --- 3. TERMINAL FILE DELETION & HARD DENY ---
+
+    @Test
+    fun testTerminalDeletionCommandsDeniedWhenAllowDeleteFileIsFalse() {
+        val deletionCommands = listOf("rm", "rmdir", "del", "erase", "rd", "remove-item")
+        for (cmd in deletionCommands) {
+            val call = ToolCall(
+                id = "del_$cmd",
+                name = "execute_command",
+                arguments = """{"command":"$cmd","args":["target_file.txt"]}"""
+            )
+            // Even in TURBO and even if allowArbitraryCommands=true
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Command '$cmd' should be DENIED when allowDeleteFile=false")
+            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun testGitCleanDeniedWhenAllowDeleteFileIsFalse() {
+        val call = ToolCall(
+            id = "git_clean_deny",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["clean","-fdx"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = false),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "git clean must be DENIED when allowDeleteFile=false")
+        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+    }
+
+    @Test
+    fun testGitCleanRequiresApprovalInTurboWhenAllowDeleteFileIsTrue() {
+        val call = ToolCall(
+            id = "git_clean_appr",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["clean","-fdx"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git clean must REQUIRE APPROVAL even in Turbo")
+    }
+
+    // --- 4. DESTRUCTIVE GIT COMMANDS IN TURBO ---
+
+    @Test
+    fun testDestructiveGitCommandsRequireApprovalInTurbo() {
+        val destructiveCalls = listOf(
+            """{"command":"git","args":["reset","--hard","HEAD~1"]}""",
+            """{"command":"git","args":["checkout","-f","main"]}""",
+            """{"command":"git","args":["switch","--force","feature"]}""",
+            """{"command":"git","args":["branch","-D","obsolete"]}""",
+        )
+
+        for ((idx, argsJson) in destructiveCalls.withIndex()) {
+            val call = ToolCall(id = "git_dest_$idx", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                decision.kind,
+                "Destructive git command '$argsJson' must require approval in Turbo"
+            )
+            assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
+        }
+    }
+
+    // --- 5. SHELL LAUNCHER INSPECTION & STRICT BLOCKS ---
+
+    @Test
+    fun testShellLauncherArgumentsWithBlockedCommandsAreDeniedEvenWithArbitraryCommands() {
+        val blockedCalls = listOf(
+            """{"command":"cmd.exe","args":["/c","format","C:"]}""",
+            """{"command":"powershell","args":["-Command","shutdown /s /t 0"]}""",
+            """{"command":"bash","args":["-c","mkfs.ext4 /dev/sda1"]}""",
+        )
+
+        for ((idx, argsJson) in blockedCalls.withIndex()) {
+            val call = ToolCall(id = "shell_block_$idx", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Shell call with blocked command '$argsJson' must be DENIED")
+            assertTrue(decision.reason.contains("forbidden command", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun testShellQuoteSplittingObfuscationBlocked() {
+        val obfuscatedCalls = listOf(
+            """{"command":"cmd.exe","args":["/c","f\"o\"r\"m\"a\"t C:"]}""",
+            """{"command":"powershell","args":["-Command","& ('shut' + 'down') /s"]}""",
+            """{"command":"bash","args":["-c","s'h'u't'd'o'w'n -h now"]}""",
+        )
+
+        for ((idx, argsJson) in obfuscatedCalls.withIndex()) {
+            val call = ToolCall(id = "obf_$idx", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Obfuscated command '$argsJson' must be DENIED")
+        }
+    }
+
+    @Test
+    fun testPowerShellBase64EncodedBlockedCommandDenied() {
+        val rawCommand = "shutdown /s /t 0"
+        val base64Payload = Base64.getEncoder().encodeToString(rawCommand.toByteArray(StandardCharsets.UTF_16LE))
+        val call = ToolCall(
+            id = "ps_b64",
+            name = "execute_command",
+            arguments = """{"command":"powershell","args":["-EncodedCommand","$base64Payload"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "PowerShell with Base64 encoded blocked command must be DENIED")
+        assertTrue(decision.reason.contains("forbidden command", ignoreCase = true))
+    }
+
+    @Test
+    fun testPowerShellInvalidBase64Denied() {
+        val call = ToolCall(
+            id = "ps_bad_b64",
+            name = "execute_command",
+            arguments = """{"command":"powershell","args":["-enc","!@#notbase64"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+        assertTrue(decision.reason.contains("Undecodable or invalid", ignoreCase = true))
+    }
+
+    // --- 6. TURBO DOES NOT BYPASS HARD INVARIANTS ---
+
+    @Test
+    fun testTurboAllowsSafeOperationsImmediately() {
+        val readCall = ToolCall(id = "12", name = "read_file", arguments = """{"path":"sample.txt"}""")
+        val readDec = policy.evaluate(readCall, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, readDec.kind)
+
+        val gitCall = ToolCall(id = "13", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
+        val gitDec = policy.evaluate(gitCall, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, gitDec.kind)
+    }
+
+    @Test
+    fun testTurboDoesNotBypassDisabledReadFile() {
+        val call = ToolCall(id = "14", name = "read_file", arguments = """{"path":"sample.txt"}""")
+        val decision = policy.evaluate(call, SecurityPermissions(allowReadFile = false), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+    }
+
+    @Test
+    fun testTurboDoesNotBypassDisabledWriteFile() {
+        val call = ToolCall(id = "15", name = "write_file", arguments = """{"path":"sample.txt","content":"data"}""")
+        val decision = policy.evaluate(call, SecurityPermissions(allowWriteFile = false), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+    }
+
+    @Test
+    fun testTurboDoesNotBypassAllowDeleteFalse() {
+        val call = ToolCall(id = "16", name = "delete_file", arguments = """{"path":"sample.txt"}""")
+        val decision = policy.evaluate(call, SecurityPermissions(allowDeleteFile = false), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+    }
+
+    @Test
+    fun testTurboDoesNotBypassDisabledExecuteCommand() {
+        val call = ToolCall(id = "17", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
+        val decision = policy.evaluate(call, SecurityPermissions(allowExecuteCommand = false), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+    }
+
+    @Test
+    fun testTurboDoesNotBypassTerminalAllowlist() {
+        val call = ToolCall(id = "18", name = "execute_command", arguments = """{"command":"unknown_custom_tool","args":[]}""")
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = false),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+        assertTrue(decision.reason.contains("not in the allowed commands list", ignoreCase = true))
+    }
+
+    @Test
+    fun testTurboDoesNotBypassTerminalBlockedCommands() {
+        val call = ToolCall(id = "19", name = "execute_command", arguments = """{"command":"format","args":["C:"]}""")
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+        assertTrue(decision.reason.contains("strictly forbidden", ignoreCase = true))
+    }
+
+    @Test
+    fun testTurboDoesNotBypassWorkspaceEnforcementAndPathTraversal() {
+        val outsideFile = workspaceDir.parent.resolve("forbidden.txt")
+        val call = ToolCall(id = "20", name = "read_file", arguments = """{"path":"../forbidden.txt"}""")
+        val decision = policy.evaluate(call, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind)
+        assertTrue(decision.reason.contains("Path boundary violation", ignoreCase = true))
+    }
+
+    @Test
+    fun testTurboDoesNotAutoApproveUnknownTool() {
+        val call = ToolCall(id = "21", name = "some_invented_tool", arguments = "{}")
+        val decision = policy.evaluate(call, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir)
+        assertEquals(SecurityDecisionKind.UNKNOWN_TOOL, decision.kind)
+    }
+
+    // --- 7. POLICY ENFORCING TOOL EXECUTOR INTEGRATION ---
+
+    @Test
+    fun testPolicyEnforcerRejectionPreventsExecution() = runBlocking {
+        val mock = MockToolExecutor()
+        val approver = UiCommandApprover()
+        val enforcer = PolicyEnforcingToolExecutor(
+            delegate = mock,
+            approver = approver,
+            initialPermissions = SecurityPermissions(allowReadFile = true),
+            initialPreset = SecurityPreset.REQUEST_REVIEW,
+            workspaceRoot = workspaceDir,
+        )
+
+        // Launch execution in background coroutine - it will suspend waiting for approval
+        val job = kotlinx.coroutines.launch {
+            val call = ToolCall(id = "call_1", name = "read_file", arguments = """{"path":"sample.txt"}""")
+            val result = enforcer.execute(call)
+            assertFalse(result.isSuccess)
+            assertTrue(result.content.contains("rejected by user", ignoreCase = true))
+        }
+
+        // Wait for approval request to be posted
+        var pendingId: String? = null
+        for (i in 0 until 50) {
+            val pending = approver.pendingApprovals.value
+            if (pending.isNotEmpty()) {
+                pendingId = pending.first().id
+                break
+            }
+            kotlinx.coroutines.delay(20)
+        }
+
+        assertTrue(pendingId != null, "Pending approval must be created")
+        approver.reject(pendingId!!)
+        job.join()
+        assertEquals(0, mock.calls.size, "Delegate executor must NEVER be called when request is rejected")
+    }
+
+    @Test
+    fun testPolicyEnforcerApprovalAllowsExecution() = runBlocking {
+        val mock = MockToolExecutor()
+        mock.registerResult("read_file", "file contents")
+        val approver = UiCommandApprover()
+        val enforcer = PolicyEnforcingToolExecutor(
+            delegate = mock,
+            approver = approver,
+            initialPermissions = SecurityPermissions(allowReadFile = true),
+            initialPreset = SecurityPreset.REQUEST_REVIEW,
+            workspaceRoot = workspaceDir,
+        )
+
+        val job = kotlinx.coroutines.launch {
+            val call = ToolCall(id = "call_2", name = "read_file", arguments = """{"path":"sample.txt"}""")
+            val result = enforcer.execute(call)
+            assertTrue(result.isSuccess)
+            assertEquals("file contents", result.content)
+        }
+
+        var pendingId: String? = null
+        for (i in 0 until 50) {
+            val pending = approver.pendingApprovals.value
+            if (pending.isNotEmpty()) {
+                pendingId = pending.first().id
+                break
+            }
+            kotlinx.coroutines.delay(20)
+        }
+
+        assertTrue(pendingId != null, "Pending approval must be created")
+        approver.approve(pendingId!!)
+        job.join()
+        assertEquals(1, mock.calls.size, "Delegate executor must be called once when request is approved")
+    }
+
+    // --- 8. REGRESSION TESTS: GIT OPTIONS, SHELL OBFUSCATION & BASE64 ---
+
+    @Test
+    fun testGitWithOptionsCleanDeniedWhenAllowDeleteFileIsFalse() {
+        val call = ToolCall(
+            id = "git_opt_clean",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["-C","subpath","clean","-fdx"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "git -C subpath clean must be DENIED when allowDeleteFile=false")
+        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+    }
+
+    @Test
+    fun testGitWithOptionsResetRequiresApprovalInTurbo() {
+        val call = ToolCall(
+            id = "git_opt_reset",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["-C","subpath","reset","--hard"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git -C subpath reset must require approval in Turbo")
+        assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
+    }
+
+    @Test
+    fun testGitCheckoutForceWithOptionsRequiresApprovalInTurbo() {
+        val call = ToolCall(
+            id = "git_opt_checkout",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["--no-pager","checkout","-f","main"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git --no-pager checkout -f must require approval in Turbo")
+        assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
+    }
+
+    @Test
+    fun testGitBranchDeleteVariantsRequireApprovalInTurbo() {
+        val branchCalls = listOf(
+            """{"command":"git","args":["branch","-D","feature"]}""",
+            """{"command":"git","args":["branch","-d","-f","feature"]}""",
+            """{"command":"git","args":["-C","sub","branch","--delete","--force","feature"]}""",
+        )
+        for (argsJson in branchCalls) {
+            val call = ToolCall(id = "git_branch_del", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Branch delete '$argsJson' must require approval in Turbo")
+            assertTrue(decision.reason.contains("Destructive Git operation", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun testChainedCommandDeniedWhenDeleteForbidden() {
+        val chainedCalls = listOf(
+            """{"command":"sh","args":["-c","echo ok; rm file.txt"]}""",
+            """{"command":"bash","args":["-c","ls && rm -rf /"]}""",
+            """{"command":"cmd.exe","args":["/c","dir & del file.txt"]}""",
+            """{"command":"cmd.exe","args":["/c","dir && erase file.txt"]}""",
+            """{"command":"powershell","args":["-Command","Get-ChildItem; Remove-Item file.txt"]}""",
+        )
+        for (argsJson in chainedCalls) {
+            val call = ToolCall(id = "chain_del", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Chained command with deletion '$argsJson' must be DENIED when allowDeleteFile=false")
+            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+        }
+    }
+
+    // --- 9. STAGE 7.4.2.3: GIT ALIASES, SHELL ESCAPING, WRAPPERS & TURBO DANGEROUS ---
+
+    @Test
+    fun testGitAliasShellCommandDeniedWhenDeleteForbidden() {
+        val call = ToolCall(
+            id = "git_alias_wipe_deny",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["-c","alias.wipe=!rm -rf target","wipe"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Git alias with rm must be DENIED when allowDeleteFile=false")
+        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+    }
+
+    @Test
+    fun testGitAliasShellCommandRequiresApprovalInTurboWhenDeleteAllowed() {
+        val call = ToolCall(
+            id = "git_alias_wipe_appr",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["-c","alias.wipe=!rm -rf target","wipe"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Git alias definition must require approval in Turbo")
+    }
+
+    @Test
+    fun testGitConfigAliasRequiresApprovalOrDenied() {
+        // Denied when allowDeleteFile=false and contains rm
+        val denyCall = ToolCall(
+            id = "git_cfg_alias_deny",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["config","alias.wipe","!rm -rf target"]}"""
+        )
+        val denyDecision = policy.evaluate(
+            call = denyCall,
+            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, denyDecision.kind)
+
+        // Requires approval when allowDeleteFile=true
+        val apprDecision = policy.evaluate(
+            call = denyCall,
+            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, apprDecision.kind)
+    }
+
+    @Test
+    fun testGitUnknownSubcommandOrAliasRequiresApprovalInTurboAndDefault() {
+        val call = ToolCall(
+            id = "git_unknown_sub",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["wipe"]}"""
+        )
+        // In Turbo
+        val turboDecision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDecision.kind, "Unknown Git subcommand 'wipe' must require approval in Turbo")
+        assertTrue(turboDecision.reason.contains("Unknown Git subcommand", ignoreCase = true) || turboDecision.reason.contains("Dangerous", ignoreCase = true))
+
+        // In Default
+        val defaultDecision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = true),
+            preset = SecurityPreset.DEFAULT,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDecision.kind, "Unknown Git subcommand 'wipe' must require approval in Default")
+    }
+
+    @Test
+    fun testGitExecPathStandaloneFlagCleanDeniedWhenDeleteForbidden() {
+        val call = ToolCall(
+            id = "git_exec_clean",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["--exec-path","clean","-fdx"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.DENIED, decision.kind, "git --exec-path clean must be DENIED when allowDeleteFile=false")
+        assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+    }
+
+    @Test
+    fun testGitExecPathCleanRequiresApprovalInTurboWhenDeleteAllowed() {
+        val call = ToolCall(
+            id = "git_exec_clean_appr",
+            name = "execute_command",
+            arguments = """{"command":"git","args":["--exec-path","clean","-fdx"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "git --exec-path clean must require approval in Turbo")
+    }
+
+    @Test
+    fun testShellBackslashEscapingDeletionDeniedWhenDeleteForbidden() {
+        val calls = listOf(
+            """{"command":"bash","args":["-c","r\\m -rf target"]}""",
+            """{"command":"sh","args":["-c","r\\m target"]}""",
+            """{"command":"cmd","args":["/c","r\\m target"]}""",
+        )
+        for (argsJson in calls) {
+            val call = ToolCall(id = "esc_del", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Escaped rm '$argsJson' must be DENIED when allowDeleteFile=false")
+            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun testShellBackslashEscapingRequiresApprovalWhenDeleteAllowed() {
+        val call = ToolCall(
+            id = "esc_del_appr",
+            name = "execute_command",
+            arguments = """{"command":"bash","args":["-c","r\\m -rf target"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Escaped rm must require approval in Turbo")
+    }
+
+    @Test
+    fun testShellCommandSubstitutionDeniedWhenDeleteForbidden() {
+        val calls = listOf(
+            """{"command":"bash","args":["-c","echo $(rm -rf target)"]}""",
+            """{"command":"sh","args":["-c","echo `rm target`"]}""",
+        )
+        for (argsJson in calls) {
+            val call = ToolCall(id = "subst_del", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Command substitution '$argsJson' must be DENIED when allowDeleteFile=false")
+        }
+    }
+
+    @Test
+    fun testPowerShellBase64Variants() {
+        val rawCommand = "shutdown /s /t 0"
+        val base64Payload = Base64.getEncoder().encodeToString(rawCommand.toByteArray(StandardCharsets.UTF_16LE))
+
+        val variants = listOf(
+            """{"command":"powershell","args":["-Encoded","$base64Payload"]}""",
+            """{"command":"powershell","args":["-EncodedCommand:$base64Payload"]}""",
+            """{"command":"powershell","args":["-e","$base64Payload"]}""",
+        )
+        for (argsJson in variants) {
+            val call = ToolCall(id = "ps_var", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "PowerShell variant '$argsJson' must be DENIED")
+            assertTrue(decision.reason.contains("forbidden command", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun testWrapperCommandsSudoRmDeniedWhenDeleteForbidden() {
+        val wrappers = listOf(
+            """{"command":"sudo","args":["rm","-rf","target"]}""",
+            """{"command":"sudo","args":["-u","root","rm","-rf","target"]}""",
+            """{"command":"doas","args":["rm","target"]}""",
+            """{"command":"busybox","args":["rm","target"]}""",
+            """{"command":"env","args":["rm","target"]}""",
+            """{"command":"env","args":["FOO=1","BAR=2","rm","target"]}""",
+            """{"command":"sudo","args":["git","clean","-fdx"]}""",
+        )
+        for (argsJson in wrappers) {
+            val call = ToolCall(id = "wrap_del", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, decision.kind, "Wrapper deletion '$argsJson' must be DENIED when allowDeleteFile=false")
+            assertTrue(decision.reason.contains("allowDeleteFile=false", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun testWrapperCommandsRequireApprovalWhenDeleteAllowed() {
+        val call = ToolCall(
+            id = "sudo_rm_appr",
+            name = "execute_command",
+            arguments = """{"command":"sudo","args":["rm","-rf","target"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+            preset = SecurityPreset.TURBO,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "sudo rm must require approval in Turbo")
+    }
+
+    @Test
+    fun testTurboRequiresApprovalForDangerousCommandsEvenWithArbitraryCommands() {
+        val dangerousCalls = listOf(
+            """{"command":"sudo","args":["apt","update"]}""",
+            """{"command":"chmod","args":["777","file.txt"]}""",
+            """{"command":"chown","args":["root","file.txt"]}""",
+        )
+        for (argsJson in dangerousCalls) {
+            val call = ToolCall(id = "danger_call", name = "execute_command", arguments = argsJson)
+            val decision = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Dangerous command '$argsJson' must require approval in Turbo")
+        }
+    }
+
+    @Test
+    fun testShellLauncherInDefaultRequiresApprovalRegardlessOfRequireApprovalForDangerous() {
+        val call = ToolCall(
+            id = "sh_default_no_danger",
+            name = "execute_command",
+            arguments = """{"command":"bash","args":["-c","ls"]}"""
+        )
+        val decision = policy.evaluate(
+            call = call,
+            permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = false),
+            preset = SecurityPreset.DEFAULT,
+            workspaceRoot = workspaceDir,
+        )
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, decision.kind, "Shell launcher must require approval in Default even with requireApprovalForDangerous=false")
+    }
+
+    // --- 10. STAGE 7.4.2.4: GIT EXECUTION SAFETY, XARGS HARDENING & CONFIG-ENV ---
+
+    @Test
+    fun testMutatingGitCommandsRequireApprovalInTurboAndDefault() {
+        val mutatingCalls = listOf(
+            "commit" to listOf("commit", "-m", "fix"),
+            "add" to listOf("add", "."),
+            "checkout" to listOf("checkout", "main"),
+            "merge" to listOf("merge", "feature"),
+            "fetch" to listOf("fetch", "origin"),
+            "pull" to listOf("pull"),
+            "rebase" to listOf("rebase", "main"),
+            "stash" to listOf("stash"),
+            "config_hooks" to listOf("config", "core.hooksPath", "/tmp/hooks"),
+            "config_alias" to listOf("config", "alias.test", "status"),
+            "branch_create" to listOf("branch", "new-feature"),
+            "tag_create" to listOf("tag", "v1.0"),
+            "remote_add" to listOf("remote", "add", "origin", "https://github.com/repo.git"),
+        )
+
+        for ((name, args) in mutatingCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_mut_$name",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
+            )
+
+            // TURBO: must REQUIRE_APPROVAL, NEVER ALLOWED_IMMEDIATE
+            val turboDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                turboDec.kind,
+                "Git mutating command '$name' must require approval in Turbo"
+            )
+
+            // DEFAULT (with requireApprovalForDangerous=true): must REQUIRE_APPROVAL
+            val defaultDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = true),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                defaultDec.kind,
+                "Git mutating command '$name' must require approval in Default"
+            )
+
+            // DEFAULT (even with requireApprovalForDangerous=false): must REQUIRE_APPROVAL
+            val defaultNoDangerDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = false),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                defaultNoDangerDec.kind,
+                "Git mutating command '$name' must require approval in Default even with requireApprovalForDangerous=false"
+            )
+        }
+    }
+
+    @Test
+    fun testUnknownGitSubcommandRequiresApprovalInTurboAndDefault() {
+        val unknownCalls = listOf(
+            listOf("custom-subcommand"),
+            listOf("some-tool", "--flag"),
+        )
+        for (args in unknownCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_unk",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
+            )
+
+            val turboDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDec.kind)
+
+            val defaultDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true, requireApprovalForDangerous = false),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDec.kind)
+        }
+    }
+
+    @Test
+    fun testReadOnlyGitCommandsAllowedImmediatelyInDefaultAndTurbo() {
+        val readOnlyCalls = listOf(
+            listOf("status"),
+            listOf("diff"),
+            listOf("log", "-n", "5"),
+            listOf("show", "HEAD"),
+            listOf("rev-parse", "HEAD"),
+            listOf("check-ref-format", "refs/heads/main"),
+            listOf("version"),
+            listOf("describe"),
+            listOf("ls-files"),
+            listOf("ls-tree", "HEAD"),
+            listOf("shortlog"),
+            listOf("branch"),
+            listOf("branch", "-a"),
+            listOf("branch", "-r"),
+            listOf("branch", "-v"),
+            listOf("branch", "--list"),
+            listOf("branch", "--show-current"),
+            listOf("tag"),
+            listOf("tag", "-l"),
+            listOf("remote"),
+            listOf("remote", "-v"),
+            listOf("remote", "show", "origin"),
+            listOf("remote", "get-url", "origin"),
+        )
+
+        for (args in readOnlyCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_ro_${args[0]}",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
+            )
+
+            // In TURBO -> ALLOWED_IMMEDIATE
+            val turboDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.ALLOWED_IMMEDIATE,
+                turboDec.kind,
+                "Read-only git command '${args.joinToString(" ")}' should be allowed immediate in Turbo"
+            )
+
+            // In DEFAULT -> ALLOWED_IMMEDIATE
+            val defaultDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.ALLOWED_IMMEDIATE,
+                defaultDec.kind,
+                "Read-only git command '${args.joinToString(" ")}' should be allowed immediate in Default"
+            )
+
+            // In AUTO -> REQUIRES_APPROVAL
+            val autoDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.AUTO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, autoDec.kind)
+
+            // In REQUEST_REVIEW -> REQUIRES_APPROVAL
+            val reqDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowArbitraryCommands = true),
+                preset = SecurityPreset.REQUEST_REVIEW,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, reqDec.kind)
+        }
+    }
+
+    @Test
+    fun testXargsRmDeniedWhenAllowDeleteFileIsFalse() {
+        val xargsVariants = listOf(
+            listOf("rm", "target"),
+            listOf("-I{}", "rm", "target"),
+            listOf("-n", "1", "rm"),
+            listOf("-a", "input.txt", "rm"),
+            listOf("--replace={}", "rm", "target"),
+            listOf("-P", "4", "rm", "target"),
+            listOf("-0", "-r", "-t", "rm", "target"),
+        )
+
+        for (args in xargsVariants) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "xargs_del",
+                name = "execute_command",
+                arguments = """{"command":"xargs","args":[""" + jsonArgs + """]}"""
+            )
+
+            for (preset in listOf(SecurityPreset.TURBO, SecurityPreset.DEFAULT, SecurityPreset.AUTO, SecurityPreset.REQUEST_REVIEW)) {
+                val dec = policy.evaluate(
+                    call = call,
+                    permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                    preset = preset,
+                    workspaceRoot = workspaceDir,
+                )
+                assertEquals(
+                    SecurityDecisionKind.DENIED,
+                    dec.kind,
+                    "xargs deletion '${args.joinToString(" ")}' must be DENIED in preset $preset when allowDeleteFile=false"
+                )
+                assertTrue(dec.reason.contains("allowDeleteFile=false", ignoreCase = true))
+            }
+        }
+    }
+
+    @Test
+    fun testXargsRmRequiresApprovalWhenAllowDeleteFileIsTrue() {
+        val xargsVariants = listOf(
+            listOf("rm", "target"),
+            listOf("-I{}", "rm", "target"),
+            listOf("-n", "1", "rm"),
+            listOf("-a", "input.txt", "rm"),
+            listOf("--replace={}", "rm", "target"),
+            listOf("-P", "4", "rm", "target"),
+        )
+
+        for (args in xargsVariants) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "xargs_appr",
+                name = "execute_command",
+                arguments = """{"command":"xargs","args":[""" + jsonArgs + """]}"""
+            )
+
+            // TURBO
+            val turboDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, turboDec.kind, "xargs deletion must require approval in Turbo")
+
+            // DEFAULT
+            val defaultDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, defaultDec.kind, "xargs deletion must require approval in Default")
+        }
+    }
+
+    @Test
+    fun testXargsAmbiguousOrMalformedOptionsHandling() {
+        val ambiguousInvocations = listOf(
+            listOf("--unknown-flag", "rm", "target"),
+            listOf("-Z", "rm", "target"),
+            listOf("-P"),
+            emptyList(),
+            listOf("-0"),
+        )
+
+        for (args in ambiguousInvocations) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "xargs_ambig",
+                name = "execute_command",
+                arguments = """{"command":"xargs","args":[""" + jsonArgs + """]}"""
+            )
+
+            // When allowDeleteFile = false -> DENIED
+            val denyDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.DENIED,
+                denyDec.kind,
+                "Ambiguous xargs invocation '${args.joinToString(" ")}' must be DENIED when allowDeleteFile=false"
+            )
+
+            // When allowDeleteFile = true -> REQUIRES_APPROVAL
+            val apprDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                apprDec.kind,
+                "Ambiguous xargs invocation '${args.joinToString(" ")}' must REQUIRE_APPROVAL when allowDeleteFile=true"
+            )
+        }
+    }
+
+    @Test
+    fun testGitConfigEnvAliasVariantsDeniedWhenDeleteForbidden() {
+        val configEnvCalls = listOf(
+            listOf("--config-env=alias.wipe=WIPE_COMMAND", "wipe"),
+            listOf("--config-env", "alias.wipe=WIPE_COMMAND", "wipe"),
+            listOf("-c", "alias.wipe=!rm -rf target", "wipe"),
+            listOf("-calias.wipe=!rm -rf target", "wipe"),
+        )
+
+        for (args in configEnvCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_cfg_env_deny",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
+            )
+
+            for (preset in listOf(SecurityPreset.TURBO, SecurityPreset.DEFAULT, SecurityPreset.AUTO, SecurityPreset.REQUEST_REVIEW)) {
+                val dec = policy.evaluate(
+                    call = call,
+                    permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                    preset = preset,
+                    workspaceRoot = workspaceDir,
+                )
+                assertEquals(
+                    SecurityDecisionKind.DENIED,
+                    dec.kind,
+                    "Git alias invocation '${args.joinToString(" ")}' must be DENIED in preset $preset when allowDeleteFile=false"
+                )
+                assertTrue(dec.reason.contains("allowDeleteFile=false", ignoreCase = true))
+            }
+        }
+    }
+
+    @Test
+    fun testGitConfigEnvAliasVariantsRequireApprovalWhenDeleteAllowed() {
+        val configEnvCalls = listOf(
+            listOf("--config-env=alias.wipe=WIPE_COMMAND", "wipe"),
+            listOf("--config-env", "alias.wipe=WIPE_COMMAND", "wipe"),
+            listOf("-c", "alias.wipe=!rm -rf target", "wipe"),
+            listOf("-calias.wipe=!rm -rf target", "wipe"),
+        )
+
+        for (args in configEnvCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_cfg_env_appr",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
+            )
+
+            // TURBO: REQUIRES_APPROVAL
+            val turboDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                turboDec.kind,
+                "Git alias invocation '${args.joinToString(" ")}' must require approval in Turbo"
+            )
+
+            // DEFAULT: REQUIRES_APPROVAL
+            val defaultDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.DEFAULT,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(
+                SecurityDecisionKind.REQUIRES_APPROVAL,
+                defaultDec.kind,
+                "Git alias invocation '${args.joinToString(" ")}' must require approval in Default"
+            )
+        }
+    }
+
+    @Test
+    fun testGitAmbiguousGlobalOptionsHandling() {
+        val ambiguousCalls = listOf(
+            listOf("-c"),
+            listOf("--config-env"),
+        )
+
+        for (args in ambiguousCalls) {
+            val jsonArgs = args.joinToString(",") { "\"$it\"" }
+            val call = ToolCall(
+                id = "git_ambig_opt",
+                name = "execute_command",
+                arguments = """{"command":"git","args":[""" + jsonArgs + """]}"""
+            )
+
+            val denyDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = false, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.DENIED, denyDec.kind)
+
+            val apprDec = policy.evaluate(
+                call = call,
+                permissions = SecurityPermissions(allowDeleteFile = true, allowArbitraryCommands = true),
+                preset = SecurityPreset.TURBO,
+                workspaceRoot = workspaceDir,
+            )
+            assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, apprDec.kind)
+        }
+    }
+
+    @Test
+    fun testPresetMatrixAcrossMutatingAndReadOnlyGit() {
+        val roCall = ToolCall(id = "ro_git", name = "execute_command", arguments = """{"command":"git","args":["status"]}""")
+        val mutCall = ToolCall(id = "mut_git", name = "execute_command", arguments = """{"command":"git","args":["commit","-m","test"]}""")
+
+        // Matrix test
+        // 1. REQUEST_REVIEW: everything allowed requires approval
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(roCall, SecurityPermissions(), SecurityPreset.REQUEST_REVIEW, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(mutCall, SecurityPermissions(), SecurityPreset.REQUEST_REVIEW, workspaceDir).kind)
+
+        // 2. AUTO: all terminal commands require approval
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(roCall, SecurityPermissions(), SecurityPreset.AUTO, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(mutCall, SecurityPermissions(), SecurityPreset.AUTO, workspaceDir).kind)
+
+        // 3. DEFAULT: read-only is ALLOWED_IMMEDIATE, mutating is REQUIRES_APPROVAL
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(roCall, SecurityPermissions(), SecurityPreset.DEFAULT, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(mutCall, SecurityPermissions(), SecurityPreset.DEFAULT, workspaceDir).kind)
+
+        // 4. TURBO: read-only is ALLOWED_IMMEDIATE, mutating is REQUIRES_APPROVAL
+        assertEquals(SecurityDecisionKind.ALLOWED_IMMEDIATE, policy.evaluate(roCall, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir).kind)
+        assertEquals(SecurityDecisionKind.REQUIRES_APPROVAL, policy.evaluate(mutCall, SecurityPermissions(), SecurityPreset.TURBO, workspaceDir).kind)
+
+        // Hard deny: disabled allowExecuteCommand blocks both in all presets
+        val noExecPerms = SecurityPermissions(allowExecuteCommand = false)
+        for (preset in SecurityPreset.entries) {
+            assertEquals(SecurityDecisionKind.DENIED, policy.evaluate(roCall, noExecPerms, preset, workspaceDir).kind)
+            assertEquals(SecurityDecisionKind.DENIED, policy.evaluate(mutCall, noExecPerms, preset, workspaceDir).kind)
+        }
+    }
+}
+```
+
+---
+
+### Файл 3: `shared/build.gradle.kts`
+- **Статус**: MODIFIED
+- **Количество строк**: 62
+- **Описание изменений**: явная привязка sourceSets KMP к рабочей директории `src2` (`src2/commonMain/kotlin`, `src2/commonTest/kotlin`, `src2/jvmMain/kotlin`, `src2/jvmTest/kotlin`), регистрация `compose.resources.customDirectory` для генерации акцессоров ресурсов Compose из `src2/commonMain/composeResources`, лимит `maxHeapSize = "2048m"`.
+
+```kotlin
+plugins {
+    alias(libs.plugins.kotlinMultiplatform)
+    alias(libs.plugins.composeMultiplatform)
+    alias(libs.plugins.composeCompiler)
+}
+
+kotlin {
+    jvm()
+    sourceSets {
+        commonMain {
+            kotlin.srcDirs("src2/commonMain/kotlin")
+            resources.srcDirs("src2/commonMain/composeResources")
+            dependencies {
+                implementation(libs.compose.runtime)
+                implementation(libs.compose.foundation)
+                implementation(libs.compose.material3)
+                implementation(libs.compose.ui)
+                implementation(libs.compose.components.resources)
+                implementation(libs.compose.uiToolingPreview)
+                implementation(libs.androidx.lifecycle.viewmodelCompose)
+                implementation(libs.androidx.lifecycle.runtimeCompose)
+            }
+        }
+        commonTest {
+            kotlin.srcDirs("src2/commonTest/kotlin")
+            dependencies {
+                implementation(libs.kotlin.test)
+            }
+        }
+        jvmMain {
+            kotlin.srcDirs("src2/jvmMain/kotlin")
+            dependencies {
+            }
+        }
+        jvmTest {
+            kotlin.srcDirs("src2/jvmTest/kotlin")
+        }
+    }
+}
+
+compose.resources {
+    customDirectory(
+        sourceSetName = "commonMain",
+        directoryProvider = provider { layout.projectDirectory.dir("src2/commonMain/composeResources") }
+    )
+}
+
+tasks.withType<Test> {
+    maxHeapSize = "2048m"
+}
+
+tasks.register<Test>("geminiRealSmokeTest") {
+    group = "verification"
+    description = "Runs live Gemini smoke test against real authenticated WebView2 session"
+    val jvmTestTask = tasks.named<Test>("jvmTest").get()
+    classpath = jvmTestTask.classpath
+    testClassesDirs = jvmTestTask.testClassesDirs
+    systemProperty("antigooglity.gemini.real.smoke", "true")
+    filter {
+        includeTestsMatching("com.limer.antigooglity.webview2.gemini.GeminiRealSmokeTest.*")
+    }
+}
+```
+
+---
+
+### Файл 4: `desktopApp/build.gradle.kts`
+- **Статус**: MODIFIED
+- **Количество строк**: 40
+- **Описание изменений**: настройка `kotlin.sourceSets.main.kotlin.srcDirs("src2/main/kotlin")` для работы с актуальной директорией `src2`.
+
+```kotlin
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+
+plugins {
+    alias(libs.plugins.kotlinJvm)
+    alias(libs.plugins.composeMultiplatform)
+    alias(libs.plugins.composeCompiler)
+}
+
+kotlin {
+    sourceSets {
+        main {
+            kotlin.srcDirs("src2/main/kotlin")
+        }
+    }
+}
+
+dependencies {
+    implementation(project(":shared"))
+
+    implementation(compose.desktop.currentOs)
+    implementation(libs.compose.runtime)
+    implementation(libs.compose.foundation)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.ui)
+    implementation(libs.kotlinx.coroutinesSwing)
+
+    implementation(libs.compose.uiToolingPreview)
+}
+
+compose.desktop {
+    application {
+        mainClass = "com.limer.antigooglity.MainKt"
+
+        nativeDistributions {
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
+            packageName = "com.limer.antigooglity"
+            packageVersion = "1.0.0"
+        }
+    }
+}
+```
+
+---
+
+### Файл 5: `docs/architecture.md`
+- **Статус**: MODIFIED
+- **Количество строк**: 296
+- **Описание изменений**: фиксация архитектуры этапа 7.4.2.4: трёхкомпонентная классификация Git-команд (Read-only, Mutating, Unknown), конечный автомат разбора `xargs`, блокировка скрытых алиасов через `--config-env`, правила согласования пресетов и актуальная статистика тестирования (167 тестов, 0 failures, 0 errors, 1 skipped).
+
+```markdown
+# Архитектура Antigooglity
+
+Данный документ фиксирует актуальное архитектурное состояние проекта Antigooglity после реализации и стабилизации скрытого браузерного runtime на базе Microsoft WebView2, контроллера интерфейса Gemini (Этапы 1, 2, 3, 7.3, 7.3.1, 7.3.2) и подсистемы безопасности Security Presets & Git Integration (Этапы 7.4.2, 7.4.2.1, 7.4.2.2, 7.4.2.3, 7.4.2.4).
+
+---
+
+## 1. Границы модулей
+
+Проект состоит из двух основных Gradle-модулей и вспомогательного автономного инструмента:
+
+1. **`:shared`** (Kotlin Multiplatform / JVM):
+   - **`commonMain`**: ядро агента (**Agent Core**), абстракции моделей (`ModelAdapter`), событийная модель (`AgentEvent`), интерфейсы и базовые mock-реализации инструментов, кроссплатформенные ресурсы. Не содержит платформо-зависимого кода WebView2.
+   - **`jvmMain`**:
+     - JVM-реализация координатора (**`AgentCoordinator`**, **`AgentFactory`**), модели безопасности (`SecurityPolicy`, `PolicyEnforcingToolExecutor`, `UiCommandApprover`, `SecurityPermissions`, `SecurityPreset`), парсеры аргументов инструментов и команд.
+     - Интеграция с локальным Git (**`JvmGitService`**): безопасное получение статуса, переключение веток, валидация через `git check-ref-format`, изоляция границ workspace.
+     - **Браузерный клиент (`com.limer.antigooglity.webview2`)**:
+       - `WebView2HostClient`: клиент дочернего процесса Host через JSON Lines IPC.
+       - `WebView2Protocol`: строгий RFC-8259 JSON-парсер (`SimpleJsonValue`) и контракт сообщений протокола.
+       - `GeminiDomController`: контроллер взаимодействия с Web UI Google Gemini (аудит состояния, ввод промпта, закрытие попапов, корреляция ходов диалога по устойчивым контейнерам).
+   - **`commonTest` / `jvmTest`**: unit- и интеграционные тесты Agent Core, координатора, моделей безопасности, Git-интеграции, WebView2 IPC и контроллера Gemini.
+
+2. **`:desktopApp`** (Compose Multiplatform Desktop Application):
+   - Точка входа в приложение (`MainKt`).
+   - Десктопный пользовательский интерфейс (UI) на базе Jetpack Compose for Desktop.
+   - Компоненты UI: `AntigravityComposer`, `Popups` (`PermissionPresetPopup`, `GitBranchSelectorPopup`), `InlineApprovalCard`, `SettingsDialog`.
+   - Зависит исключительно от `:shared`.
+
+3. **`tools/webview2-host`** (.NET 8 WinForms Host):
+   - Отдельный дочерний C#-процесс (`AntigooglityWebView2Host.exe`).
+   - Создаёт скрытый контрол Microsoft WebView2 (`IsVisible = false`) с постоянным пользовательским профилем.
+   - Поддерживает временный видимый диагностический режим (`SET_VISIBILITY`).
+   - Обеспечивает корректный STA Windows Message Loop и строго последовательное асинхронное исполнение команд через `System.Threading.Channels.Channel`.
+
+---
+
+## 2. Архитектура Agent Core (`shared/commonMain`, `shared/jvmMain`)
+
+Agent Core представляет собой независимое, реактивное ядро выполнения автономных агентных циклов.
+
+### Ключевые компоненты:
+- **`Agent`**: фасад выполнения задачи. Принимает пользовательский запрос и координирует итерации `AgentLoop`.
+- **`AgentLoop`**: цикл рассуждений и действий (Reasoning and Action Loop). На каждой итерации:
+  1. Запрашивает следующее действие у `ModelAdapter`.
+  2. Генерирует событие `AgentEvent.Thinking`.
+  3. Если модель запрашивает вызовы инструментов (`ToolCall`), последовательно выполняет их через `ToolExecutor`.
+  4. Генерирует события `AgentEvent.ToolRequested` и `AgentEvent.ToolCompleted`.
+  5. Передаёт результаты работы инструментов обратно в контекст диалога.
+  6. При получении финального ответа модели завершает цикл событием `AgentEvent.Completed`.
+- **`AgentContext`**: хранит историю сообщений диалога (`AgentMessage`: `SYSTEM`, `USER`, `ASSISTANT`, `TOOL`), имя задачи и контекстные метаданные.
+- **`AgentConfig`**: конфигурация агента (системный промпт, ограничение максимального числа итераций `maxIterations`).
+- **`AgentEvent`**: типизированные события жизненного цикла (`Started`, `Thinking`, `ToolRequested`, `ToolCompleted`, `Completed`, `Failed`).
+- **`ToolCall` & `ToolResult`**: контракты вызова инструмента (ID, имя, JSON-аргументы) и результата его выполнения (ID, текстовый контент, флаг успешности).
+- **`ToolExecutor`**: интерфейс выполнения вызовов инструментов агентом.
+- **`ModelAdapter` & `ModelResponse`**: контракт интеграции языковой модели и структура её ответа (текст + список вызовов `ToolCall`).
+- **`AgentCoordinator`**: координатор прикладного уровня, связывающий Compose UI с ядром агента. Управляет переключением диалогов, состоянием выполнения (`ExecutionStatus`), потоками событий (`StateFlow`), директорией workspace, профилями безопасности (`SecurityPreset`), разрешениями (`SecurityPermissions`), одобрением команд (`UiCommandApprover`) и состоянием Git (`GitRepositoryInfo`).
+
+---
+
+## 3. WebView2 Browser Runtime: архитектура и границы
+
+### 3.1 Граница Kotlin / .NET
+
+```
++-----------------------------------------------------------+
+| Kotlin/JVM (:shared/jvmMain)                              |
+|                                                           |
+|  [GeminiDomController] ---> [WebView2HostClient]          |
+|                                     | (stdin/stdout)      |
++-------------------------------------|---------------------+
+                                      | JSON Lines IPC
++-------------------------------------|---------------------+
+| .NET 8 Host (AntigooglityWebView2Host.exe)                |
+|                                     v                     |
+|  [RunStdinReader] ---> [Channel<HostCommand>]             |
+|                                     | (Sequential STA)    |
+|                             [BrowserController]           |
+|                                     |                     |
+|                           [Microsoft WebView2]            |
+|                     (Hidden WinForms HWND / STA Loop)     |
++-----------------------------------------------------------+
+```
+
+### 3.2 JSON Lines IPC Протокол
+
+Обмен между Kotlin и .NET Host осуществляется строками UTF-8 JSON Lines через перенаправленные потоки stdin / stdout:
+
+- **Команда из Kotlin (stdin Host):**
+  ```json
+  {
+    "requestId": "req-1a2b3c4d",
+    "command": "EXECUTE_SCRIPT",
+    "script": "(function() { ... })()",
+    "timeoutMs": 15000
+  }
+  ```
+- **Ответ от Host (stdout Kotlin):**
+  ```json
+  {
+    "requestId": "req-1a2b3c4d",
+    "command": "EXECUTE_SCRIPT",
+    "success": true,
+    "data": { "result": { ... } },
+    "error": null
+  }
+  ```
+
+---
+
+## 4. Контроллер веб-интерфейса Gemini (`GeminiDomController`)
+
+### 4.1 Аудит состояния (`auditState`)
+- Проверяет URL (`https://gemini.google.com`).
+- Проверяет доступность DOM (`DOM_READY`).
+- Проверяет аутентификацию пользователя (`NEEDS_LOGIN`).
+- Обнаруживает модальные окна и уведомления (`BLOCKED_BY_POPUP`).
+- Проверяет доступность редактора ввода промпта (`EDITOR_NOT_FOUND`).
+- Проверяет текущую активность генерации (`isGenerating`).
+
+### 4.2 Ввод и отправка промпта (`sendPrompt`)
+1. **Закрытие блокирующих попапов**: вызов `dismissPopupsIfPresent()` перед вводом.
+2. **Предусловия**: хост строго `https://gemini.google.com`, редактор найден и доступен, генерация не выполняется, поле ввода пустое (при наличии текста — `EDITOR_NOT_EMPTY`).
+3. **Фиксация снимка диалога**: снимок контейнеров сообщений (`GeminiConversationSnapshot`) валидируется до модификации DOM.
+4. **Вставка и верификация текста**: текст вставляется через `document.execCommand('insertText', false, text)` и проверяется совпадение текста в редакторе с отправляемым промптом (`INSERTED_TEXT_MISMATCH`).
+5. **Однократный триггер отправки**: если кнопка отправки найдена, но отключена — Enter не отправляется автоматически, возвращается ошибка `SEND_BUTTON_DISABLED`.
+6. **Подтверждение отправки в DOM**: подтверждение требует фактического появления нового пользовательского сообщения в DOM с текстом отправленного промпта (только очистки редактора недостаточно). Если подтверждение не получено за 5 секунд, возвращается `SEND_NOT_CONFIRMED` без повторной отправки.
+
+### 4.3 Корреляция ходов диалога (`waitForResponse`)
+1. **Идентификация контейнеров**: контейнеры сообщений (`model-response`, `[data-test-id="model-response"]`) фильтруются от вложенных элементов (`message-content`, `.markdown`), гарантируя совпадение подсчёта в snapshot и в списке ответов.
+2. **Идентификация по ID и позиции**: фиксируются ID существующих ответов (`modelMessageIds`) и их количество (`modelResponseCount`). Новый ответ идентифицируется по появлению контейнера с новым ID или по индексу, строго превышающему предыдущий счётчик.
+3. **Идентичные ответы**: два последовательных ответа с одинаковым текстом корректно различаются как разные ходы благодаря независимым идентификаторам контейнеров и целевому индексу хода.
+4. **Стабилизация текста**: дожидается завершения генерации (`!isGenerating`) и совпадения текста нового ответа на протяжении 2 последовательных интервалов опроса.
+5. **Таймаут**: при истечении времени ожидания метод возвращает `found = false` (незавершённый ответ никогда не возвращается с `found = true`), а частичный текст возвращается в поле `partialText`.
+
+---
+
+## 5. Подсистема безопасности и пресетов (Security Subsystem)
+
+Архитектура безопасности Antigooglity строго разделяет три уровня защиты:
+
+```
++-------------------------------------------------------------------------+
+|                              ToolCall                                   |
++-------------------------------------------------------------------------+
+                                    |
+                                    v
++-------------------------------------------------------------------------+
+| 1. HARD ENFORCEMENT (Непреодолимые инварианты - ни один пресет не обходит) |
+| - Workspace Path Containment (канонизация realPath, запрет traversal ..)  |
+| - Null-byte injection rejection ('\0')                                  |
+| - Blocked commands list (format, shutdown, diskpart, regedit...)        |
+| - Shell argument deep inspection (запрет заблокированных утилит в bash/cmd) |
+| - Shell obfuscation & backslash stripping (r\m, f\ormat -> DENIED)      |
+| - PowerShell Base64 decoding & validation (-enc, -Encoded, UTF-16LE)    |
+| - Command substitution rejection in shell when delete forbidden ($(), `)  |
+| - Windows batch script prohibition (.bat, .cmd)                         |
+| - Wrapper unwrap analysis (sudo, doas, busybox, env, nohup, pkexec, xargs)|
+| - Strict xargs options parser & ambiguous flag rejection                |
+| - Opaque Git --config-env alias rejection when delete forbidden         |
+| - Git workspace containment (repoRoot строго внутри или равен workspace) |
++-------------------------------------------------------------------------+
+                                    |
+                                    v
++-------------------------------------------------------------------------+
+| 2. PERMISSION ENFORCEMENT (Статические права SecurityPermissions)       |
+| - allowReadFile / allowWriteFile / allowExecuteCommand                  |
+| - allowDeleteFile=false -> HARD DENY на удаление (rm, del, git clean...) |
+| - allowArbitraryCommands=false -> только белый список (DEFAULT_ALLOWED) |
++-------------------------------------------------------------------------+
+                                    |
+                                    v
++-------------------------------------------------------------------------+
+| 3. APPROVAL POLICY (Динамические профили подтверждений SecurityPreset)   |
+| - REQUEST_REVIEW: 100% подтверждение всех разрешённых действий          |
+| - DEFAULT: read-only сразу, mutating Git, shell и dangerous через review|
+| - AUTO: read-only и новые файлы сразу; перезапись и терминал требуют review|
+| - TURBO: немедленное выполнение safe allowlisted и read-only Git;       |
+|          mutating Git, shell, dangerous, deletions, reset/clean -> review|
++-------------------------------------------------------------------------+
+                                    |
+                                    v
++-------------------------------------------------------------------------+
+|                    PolicyEnforcingToolExecutor                          |
+|    (Единый путь исполнения: UiCommandApprover -> Delegate ToolExecutor)  |
++-------------------------------------------------------------------------+
+```
+
+### 5.1 Классификация Git-команд (Этап 7.4.2.4)
+
+Команды Git делятся на три чёткие категории с точки зрения безопасности:
+
+1. **Категория A: Read-Only Git Commands**
+   - Только операции чтения и диагностики, не изменяющие репозиторий:
+     - `status`, `diff` (без флагов вывода в файл `--output`), `log`, `show`, `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`, `help`.
+     - `branch` без флагов изменения (`git branch`, `-a`, `-r`, `-v`, `--list`, `--show-current`, `--contains`).
+     - `tag` без создания или удаления (`git tag`, `-l`, `--list`, `-v`, `--verify`).
+     - `remote` без мутирующих подкоманд (`git remote`, `-v`, `show`, `get-url`).
+   - Разрешены к немедленному выполнению (`ALLOWED_IMMEDIATE`) в пресетах `DEFAULT` и `TURBO`.
+
+2. **Категория B: Mutating Git Commands**
+   - Команды, способные изменять состояние индекса, рабочего каталога, конфигурации или истории, а также запускающие хуки (`core.hooksPath`, `.git/hooks`), smudge/clean фильтры, внешние merge drivers и credential helpers:
+     - `commit`, `add`, `checkout`, `switch`, `merge`, `rebase`, `reset`, `clean`, `restore`, `stash`, `fetch`, `pull`, `push`, `init`, `clone`, `cherry-pick`, `revert`, `config`, `am`, `apply`, `bundle`.
+     - `branch` с созданием, переименованием или удалением веток (`-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `--edit-description`, `--set-upstream-to`, создание ветки по имени).
+     - `tag` с созданием или удалением (`-d`, `--delete`, `-a`, `-s`, `-u`, `-f`, `--force`, создание тега).
+     - `remote` с добавлением или изменением (`add`, `rename`, `remove`, `rm`, `set-url`, `set-branches`, `set-head`, `prune`, `update`).
+   - **Всегда требуют подтверждения (`REQUIRES_APPROVAL`) в TURBO и DEFAULT**, независимо от флага `requireApprovalForDangerous`.
+
+3. **Категория C: Unknown Git Commands**
+   - Любая неизвестная подкоманда, кастомный Git alias или потенциальная внешняя подкоманда из `PATH`.
+   - Никогда не считается безопасной автоматически, даже если бинарный файл `git` находится в allowlist.
+   - **Всегда требует подтверждения (`REQUIRES_APPROVAL`) в TURBO и DEFAULT**.
+
+### 5.2 Парсинг утилиты `xargs` (Этап 7.4.2.4)
+
+Для предотвращения обхода ограничений на удаление файлов через `xargs` реализован специализированный конечный автомат разбора опций `parseXargsArgs`:
+- Поддерживает флаги с аргументом (`-d`, `-E`, `-e`, `-I`, `-i`, `-L`, `-l`, `-n`, `-P`, `-s`, `-a`), в том числе слитные формы (`-I{}`, `-P4`, `-n1`, `-ainput.txt`) и раздельные (`-I {}`, `-n 1`, `-a input.txt`).
+- Поддерживает длинные опции с аргументом (`--replace=...`, `--max-args`, `--max-procs`, `--arg-file`, `--delimiter`, `--eof`, `--max-lines`, `--max-chars`).
+- Поддерживает флаги-переключатели (`-0`, `-p`, `-r`, `-t`, `-o`, `--null`, `--interactive`, `--no-run-if-empty`, `--verbose`, `--open-tty`, `--exact`, `--exit`) и их кластеры (`-0rt`, `-rP4`).
+- Поддерживает разделитель `--`.
+- Извлекает целевую команду и распаковывает её цепочку в `unwrapCommand`.
+- Если команда или параметры неоднозначны/неизвестны:
+  - При `allowDeleteFile = false` -> строго `DENIED`.
+  - При `allowDeleteFile = true` -> строго `REQUIRES_APPROVAL`.
+
+### 5.3 Безопасность `--config-env` и Git Aliases (Этап 7.4.2.4)
+
+Git поддерживает определение алиасов через переменные окружения (`--config-env=alias.wipe=VAR` или `--config-env alias.wipe=VAR`). Поскольку значение конфигурации скрыто в переменной окружения и не анализируется в рантайме:
+- Любая конфигурация `--config-env`, определяющая `alias.*`, классифицируется как скрытая угроза удаления / шелл-вызова.
+- При `allowDeleteFile = false` -> возвращает `DENIED`.
+- При `allowDeleteFile = true` -> возвращает `REQUIRES_APPROVAL`.
+- Прямые алиасы `-c alias.wipe=!rm -rf target` и `-calias.wipe=!rm -rf target` также строго детектируются и блокируются (`DENIED` при `allowDeleteFile=false`).
+- Неполный или неоднозначный парсинг глобальных флагов Git (`git -c`, `git --config-env`) никогда не превращается в `ALLOWED_IMMEDIATE` (`DENIED` при `allowDeleteFile=false`, `REQUIRES_APPROVAL` при `allowDeleteFile=true`).
+
+### 5.4 Четыре профиля безопасности (`SecurityPreset`)
+
+1. **`REQUEST_REVIEW`**: Максимальный контроль. Любой ToolCall требует подтверждения пользователя через UI-карточку (`InlineApprovalCard`). Операции, запрещённые статическими правами, отклоняются сразу (`DENIED`), а не запрашиваются у пользователя.
+2. **`DEFAULT`**: Базовый баланс. Read-only операции с файлами и безопасные read-only команды Git (`status`, `diff`, `log`) выполняются немедленно (`ALLOWED_IMMEDIATE`). Мутирующие операции Git (`commit`, `add`, `checkout`, `merge`, `push` и т.д.), неизвестные команды Git, shell launchers и опасные команды требуют подтверждения (`REQUIRES_APPROVAL`).
+3. **`AUTO`**: Автономный режим с защитой от повреждения существующего кода. Read-only операции и создание *новых* файлов выполняются сразу (`ALLOWED_IMMEDIATE`). Перезапись *существующих* файлов требует подтверждения (`REQUIRES_APPROVAL`). Терминальные команды **не** считаются низкорисковыми и требуют подтверждения (`REQUIRES_APPROVAL`).
+4. **`TURBO`**: Высокая скорость. Разрешённые операции чтения, записи файлов, стандартные allowlisted команды и read-only команды Git выполняются сразу (`ALLOWED_IMMEDIATE`). **Исключения:** деструктивные операции Git (`git reset`, `git clean`, `checkout -f`), любые мутирующие операции Git (`commit`, `add`, `checkout`, `merge`), неизвестные команды/алиасы Git, команды удаления файлов, шелл-оболочки и известные опасные команды (sudo, apt, chmod) **требуют подтверждения даже в Turbo**.
+
+### 5.5 Модель безопасности и её границы (Security Model Limitations)
+
+Для корректной интерпретации гарантий безопасности Antigooglity строго разделяет 4 уровня контроля:
+
+1. **Контроль прямых файловых вызовов (`FileSystemToolExecutor`)**:
+   Обеспечивает детерминированную проверку канонических путей (`toRealPath()`), гарантирует непревышение границ workspace и предотвращает path traversal.
+2. **Семантический анализ известных терминальных команд (`TerminalToolExecutor`)**:
+   Анализирует токены, распаковывает известные утилиты-обёртки (`sudo`, `doas`, `busybox`, `env`, `nohup`, `pkexec`, `xargs`), парсит подкоманды Git (включая глобальные флаги, `--config-env` и alias definitions), нормализует шелл-экранирование (`\`, кавычки) и декодирует Base64.
+3. **Контроль запуска исполняемых сред (Runtime Execution)**:
+   Белый список команд (`DEFAULT_ALLOWED_COMMANDS`: `python`, `node`, `java`, `gradle`, `cargo`, `go` и т.д.) фильтрует исполняемые файлы, которым разрешён запуск. Однако сами по себе языковые среды исполнения являются Тьюринг-полными интерпретаторами: код, переданный скрипту Python или Node, исполняется в контексте текущего пользователя ОС. Статический анализ командной строки не может гарантировать безопасность произвольного кода внутри пользовательских скриптов.
+4. **Изоляция на уровне операционной системы (OS Sandbox)**:
+   Полноценная изоляция от произвольного вредоносного кода требует изоляции ядра ОС (Docker-контейнеры, gVisor, Linux namespaces/seccomp, Windows AppContainer). В текущей архитектуре Antigooglity OS-песочница не встроена; гарантии безопасности распространяются на инварианты ToolCall и политику подтверждения действий.
+
+### 5.6 Интеграция с Git (`JvmGitService`)
+- **Изоляция границ Workspace**: Если каталог Git-репозитория находится выше рабочего каталога агента (например, репозиторий `C:\Project`, а workspace задан как `C:\Project\Subdir`), доступ к родительскому репозиторию немедленно блокируется (`isGitRepository = false`) с ошибкой нарушения границ.
+- **Безопасность потоков**: Метод `readStreamBounded` вычитывает stdout и stderr параллельно до конца потока (EOF), предотвращая блокировку буфера каналов (pipe deadlock).
+- **Завершение дерева процессов**: При отмене корутины или таймауте (`GitTimeoutException`) принудительно уничтожается всё дерево дочерних процессов (`process.descendants() + destroyForcibly()`).
+- **Валидация веток**: Имена веток проверяются через `git check-ref-format --branch` без использования командного процессора.
+
+---
+
+## 6. Организация тестирования
+
+### 6.1 Обычный прогон тестов (`:shared:allTests`)
+- Не отправляет сетевые запросы в реальный аккаунт Google Gemini.
+- Запускает:
+  - Unit- и интеграционные тесты `SecurityPolicyTest` (62 теста: проверка всех 4 пресетов, hard deny при `allowDeleteFile=false`, блокировка шеллов, деструктивных и мутирующих Git-команд, разбор `xargs`, `--config-env`, wrapper unwrapping, различие Auto vs Default).
+  - Интеграционные тесты `AgentCoordinatorTest` (проверка динамической смены пресета, привязки аргументов к approval UUID, отмены задач во время ожидания).
+  - Тесты `JvmGitServiceTest` (изоляция родительских репозиториев, валидация веток, таймауты, отмена дерева процессов).
+  - 15 unit-тестов `GeminiDomControllerTest`.
+  - 8 интеграционных тестов `WebView2HostIntegrationTest` на изолированном временном профиле.
+  - Все unit-тесты ядра агента и файловой системы.
+- Суммарно: 167 тестов (166 passed, 0 failures, 0 errors, 1 skipped).
+- Тест `GeminiRealSmokeTest` корректно пропускается через `Assume.assumeTrue` (1 skipped).
+
+### 6.2 Ручной реальный Smoke Test (`geminiRealSmokeTest`)
+```powershell
+.\gradlew.bat :shared:geminiRealSmokeTest
+```
+
+---
+
+## 7. Статус и разделение с будущими этапами
+
+- **Реализовано и верифицировано:**
+  - .NET 8 WinForms WebView2 Host со скрытым режимом, очередью команд и безопасным завершением.
+  - Постоянный профиль авторизации Google.
+  - JSON Lines IPC протокол со строгим RFC-8259 JSON-парсером (`SimpleJsonValue`).
+  - `GeminiDomController` с проверками состояний, защитой от вложенных DOM-элементов, корреляцией ходов диалога по устойчивым контейнерам и защитой от ложного подтверждения отправки.
+  - Подсистема пресетов разрешений (Request Review, Default, Auto, Turbo) с полным аудитом, классификацией подкоманд Git, разбором `xargs`, защитой от обходов через `--config-env`, Git aliases, shell escaping, wrapper commands и hard deny защитой.
+  - Локальная интеграция с Git с контролем границ workspace и безопасным управлением процессами.
+  - 100% автоматических тестов проходят успешно.
+- **Будущий этап 7.4.3 (Планируется):**
+  - Реализация `GeminiWebView2ModelAdapter`, реализующего интерфейс `ModelAdapter`.
+  - Подключение адаптера к `AgentCoordinator` / `AgentLoop` для полноценного диалога агента с Gemini.
+  - Потоковая передача чанков ответа в события `AgentEvent.ModelStreamEvent`.
+  *(Компонент ModelAdapter для WebView2 ещё не реализован и не входит в состав текущей сборки)*.
+```
+
+---
+
+### Проверка полноты списка приложенных исходников:
+- [x] `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt` (MODIFIED, 1413 строк) — полный код включён без сокращений
+- [x] `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` (MODIFIED, 1366 строк) — полный код включён без сокращений
+- [x] `shared/build.gradle.kts` (MODIFIED, 62 строки) — полный код включён без сокращений
+- [x] `desktopApp/build.gradle.kts` (MODIFIED, 40 строк) — полный код включён без сокращений
+- [x] `docs/architecture.md` (MODIFIED, 296 строк) — полный код включён без сокращений
+
+Все требования Этапа 7.4.2.4 полностью выполнены, тесты стабилизированы, регрессионный набор верифицирован с результатом 167 тестов (166 passed, 0 failures, 0 errors, 1 skipped). Работа остановлена перед началом Этапа 7.4.3.
