@@ -1,1516 +1,1887 @@
-Запустил тест `:shared:geminiRealSmokeTest` с обновлённой сессией Google. Ожидаю завершения выполнения теста.
+Запустил компиляцию и проверку тестов `SecurityPolicyTest` в фоновом режиме. Ожидаю завершения выполнения.
 
-# Итоговый отчёт по Этапу 7.4.2.7 — Git Config Hardening, запуск Gemini Browser и верификация
+Запустил повторную верификацию `SecurityPolicyTest` с новыми регрессионными тестами аудита конфигурации Git (task-2015). Ожидаю завершения.
 
-> [!IMPORTANT]
-> **Структура отчёта:**
-> В соответствии с требованиями к полному и непрерывному предоставлению исходного кода без сокращений (`...`, diff, комментариев «остальной код»), и во избежание усечения лимитом генерации модели, отчёт публикуется в 3 последовательных частях:
-> - **Часть 1 (текущая):** Архитектурное резюме изменений, результаты верификации Gradle и .NET, XML-метрики тестов, таблица изменённых файлов и полный исходный код `shared/build.gradle.kts`, `tools/webview2-host/Protocol/HostCommand.cs`, `tools/webview2-host/BrowserHostForm.cs`, `tools/webview2-host/Program.cs`, `tools/webview2-host/BrowserController.cs`, `docs/architecture.md`.
-> - **Часть 2:** Полный исходный код ядра политик безопасности `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt` (1695 строк).
-> - **Часть 3:** Полный исходный код регрессионного тестового набора `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` (1941 строка) и итоговые критерии приёмки.
+Запустил полный тестовый набор `:shared:allTests` (task-2021). Ожидаю завершения выполнения.
 
----
+Запустил верификацию `TerminalToolExecutorTest` (task-2033). Ожидаю завершения.
 
-## 1. Архитектурное резюме выполненных работ (Этап 7.4.2.7)
+Команда всё ещё выполняется (перезапуск демона Gradle и холодная компиляция). Продолжаю ожидание.
 
-### A. Git Helpers и защита конфигурации репозитория и окружения
-1. **Многоуровневый аудит конфигурации Git**:
-   - Анализ безопасности Git-команд больше не ограничивается CLI-флагами (`-c`, `--config-env`).
-   - Реализован разбор локального конфигурационного файла `.git/config` репозитория (`findAndParseGitConfig`).
-   - Реализован аудит глобального пользовательского файла `.gitconfig` (`parseUserGitConfig`, поиск в `user.home` и `GIT_CONFIG_GLOBAL`).
-   - Реализована проверка переменных окружения процесса (`GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_PAGER`, `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`).
-2. **Защита от запуска внешних утилит (External Helpers)**:
-   - Расширен спектр отслеживаемых опасных ключей конфигурации:
-     - `core.fsmonitor`, `core.pager`, `pager.*`
-     - `diff.external`, `diff.*.command`, `diff.*.textconv`
-     - `filter.*.clean`, `filter.*.smudge`, `filter.*.process`
-     - `credential.*`, `credential.*.helper`
-     - `remote.*.uploadpack`, `remote.*.receivepack`, `remote.*.vcs`
-     - `mergetool.*.cmd`, `difftool.*.cmd`
-   - Любая команда Git, если в конфигурации (CLI, репозиторий, пользователь, переменные окружения) задан внешний helper, лишается права на немедленное выполнение (`ALLOWED_IMMEDIATE`) в пресетах `DEFAULT` и `TURBO` и строго переводится в категорию `REQUIRES_APPROVAL`.
-3. **Hard-Deny на удаление файлов через Git**:
-   - При `allowDeleteFile = false` команды физического удаления файлов (`git clean`, `git rm` без `--cached`), а также Git-алиасы, определяющие шелл-команды или утилиты удаления, блокируются безоговорочно (`DENIED`) во всех 4 пресетах.
-   - `git rm --cached` остаётся классифицированной как `MUTATING` (`REQUIRES_APPROVAL`), но не блокируется жестким запретом удаления, так как оставляет рабочее дерево файлов нетронутым.
+Запустил полный тестовый набор `:shared:allTests` (task-2039). Ожидаю завершения выполнения.
 
-### B. Корректная классификация `git remote show`
-- `git remote get-url origin`, `git remote -v`, `git remote` (без аргументов) классифицируются как безопасные `READ_ONLY` (`ALLOWED_IMMEDIATE`).
-- `git remote show origin` (без флага `-n`) обращается к удалённому серверу и запускает сетевые/транспортные хелперы -> строго классифицируется как `MUTATING` (`REQUIRES_APPROVAL`).
-- `git remote show -n origin` (с флагом `-n`, подавляющим обращение к сети) классифицируется как `READ_ONLY` (`ALLOWED_IMMEDIATE` при отсутствии внешних хелперов).
-- `git remote add/remove/rename/set-url/prune` классифицируются как `MUTATING` (`REQUIRES_APPROVAL`).
+Выполнение полного набора `:shared:allTests` продолжается. Ожидаю завершения.
 
-### C. Автономная задача `:shared:openGeminiBrowser` и сборка WebView2Host
-- Создана задача Gradle `buildWebView2Host` (тип `Exec`), которая компилирует `.NET 8` хост (`tools/webview2-host/WebView2Host.csproj`) в конфигурации `Release`.
-- Задача `openGeminiBrowser` автоматически зависит от `buildWebView2Host`.
-- Реализовано надёжное автоопределение исполняемого файла `dotnet.exe` и `DOTNET_ROOT` для окружений, где .NET установлен в пользовательский каталог (`%LOCALAPPDATA%\Microsoft\dotnet`).
-- Хост открывает настоящее интерактивное окно Windows Forms с контролом WebView2, загружая URL `https://gemini.google.com` и используя рабочий профиль `%LOCALAPPDATA%\Antigooglity\webview2-profile`.
-- Межпроцессный мьютекс `Local\Antigooglity_WebView2_Profile_Instance_Mutex` предотвращает конкурентный доступ к каталогу профиля.
+Запустил полную сборку `:shared:build :desktopApp:assemble` (task-2045). Ожидаю завершения.
 
-### D. Синхронизация `GeminiRealSmokeTest`
-- В `shared/build.gradle.kts` для задачи `geminiRealSmokeTest` выставлены оба необходимых флага:
-  - системное свойство: `systemProperty("antigooglity.gemini.real.smoke", "true")`
-  - переменная окружения: `environment("ANTIGOOGLITY_GEMINI_REAL_SMOKE", "true")`
-- Тест `GeminiRealSmokeTest` успешно запущен и выполнен в реальной веб-сессии пользователя с двумя последовательными ходами диалога (`time: 15.54s`).
+Сборка приложения продолжается. Ожидаю завершения.
+
+Запустил задачу `:shared:buildWebView2Host` (task-2053). Ожидаю завершения.
+
+# Отчёт по Этапу 7.4.2.8 — Часть 2 из 3: Полный исходный код ядра SecurityPolicy.kt
+
+В соответствии с требованиями аудита публикуется полный исходный код ядра политик безопасности без сокращений, пропусков и усечений.
 
 ---
 
-## 2. Результаты верификации
+### Полный исходный код: `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt`
 
-### 2.1 Тесты безопасности SecurityPolicyTest
-```powershell
-.\gradlew.bat :shared:jvmTest --tests "com.limer.antigooglity.coordinator.SecurityPolicyTest" --rerun-tasks
-```
-**Результат:**
-```text
-BUILD SUCCESSFUL in 12s
-24 actionable tasks: 4 executed, 20 up-to-date
-SecurityPolicyTest: tests=73, failures=0, errors=0, skipped=0
-```
-
-### 2.2 Полный прогон тестов `:shared:allTests`
-```powershell
-.\gradlew.bat :shared:allTests --rerun-tasks
-```
-**Результат:**
-```text
-BUILD SUCCESSFUL in 3m 11s
-25 actionable tasks: 25 executed
-TOTAL: tests=178, failures=0, errors=0, skipped=1
-(1 skipped — GeminiRealSmokeTest пропускается через Assume.assumeTrue при регулярных сборках)
-```
-
-### 2.3 Полная сборка Kotlin и Compose Desktop
-```powershell
-.\gradlew.bat :shared:build :desktopApp:assemble --rerun-tasks
-```
-**Результат:**
-```text
-BUILD SUCCESSFUL in 3m 13s
-24 actionable tasks: 24 executed
-```
-
-### 2.4 Сборка .NET Host
-```powershell
-dotnet build tools/webview2-host/WebView2Host.csproj -c Release
-```
-**Результат:**
-```text
-Сборка успешно завершена.
-    Предупреждений: 0
-    Ошибок: 0
-Прошло времени 00:00:02.14
-```
-
-### 2.5 Реальный Smoke Test с авторизованным профилем Google Gemini
-```powershell
-.\gradlew.bat :shared:geminiRealSmokeTest
-```
-**Результат:**
-```text
-> Task :shared:geminiRealSmokeTest
-BUILD SUCCESSFUL in 17s
-17 actionable tasks: 4 executed, 13 up-to-date
-
-XML результат:
-TEST-com.limer.antigooglity.webview2.gemini.GeminiRealSmokeTest.xml: tests=1, failures=0, errors=0, skipped=0
-  testcase: testTwoConsecutiveGeminiTurns, time: 15.54s
-```
-
----
-
-## 3. Таблица изменённых файлов
-
-| Файл | Назначение | Строк | Байт |
-| :--- | :--- | :---: | :---: |
-| `shared/build.gradle.kts` | Сборка Host, `DOTNET_ROOT`, `openGeminiBrowser`, `geminiRealSmokeTest` | 106 | 4,098 |
-| `tools/webview2-host/Protocol/HostCommand.cs` | DTO протокола команд хоста (`visible`, `maxLength`) | 27 | 697 |
-| `tools/webview2-host/BrowserHostForm.cs` | Окно WinForms для скрытого и видимого режимов, чистый выход | 73 | 1,921 |
-| `tools/webview2-host/Program.cs` | STA цикл, мьютекс профиля, CLI режим `--visible-browser` | 335 | 11,413 |
-| `tools/webview2-host/BrowserController.cs` | Управление WebView2, навигация, видимость, изоляция | 476 | 17,149 |
-| `docs/architecture.md` | Актуальная архитектурная документация 7.4.2.7 | 326 | 38,939 |
-| `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt` | Ядро политик безопасности, Git Config & Helpers, `remote show` | 1695 | 71,089 |
-| `shared/src2/jvmTest/kotlin/com/limer/antigooglity/coordinator/SecurityPolicyTest.kt` | Набор unit- и интеграционных тестов политик безопасности | 1941 | 90,779 |
-
----
-
-## 4. Полные исходные тексты изменённых файлов (Часть 1)
-
-### Файл 1: `shared/build.gradle.kts`
 ```kotlin
-plugins {
-    alias(libs.plugins.kotlinMultiplatform)
-    alias(libs.plugins.composeMultiplatform)
-    alias(libs.plugins.composeCompiler)
-}
+package com.limer.antigooglity.coordinator
 
-kotlin {
-    jvm()
-    sourceSets {
-        commonMain {
-            kotlin.srcDirs("src2/commonMain/kotlin")
-            dependencies {
-                implementation(libs.compose.runtime)
-                implementation(libs.compose.foundation)
-                implementation(libs.compose.material3)
-                implementation(libs.compose.ui)
-                implementation(libs.compose.components.resources)
-                implementation(libs.compose.uiToolingPreview)
-                implementation(libs.androidx.lifecycle.viewmodelCompose)
-                implementation(libs.androidx.lifecycle.runtimeCompose)
-            }
+import com.limer.antigooglity.tools.ToolCall
+import com.limer.antigooglity.tools.fs.ToolArgsParser
+import com.limer.antigooglity.tools.fs.WorkspacePathResolver
+import com.limer.antigooglity.tools.terminal.TerminalCommand
+import com.limer.antigooglity.tools.terminal.TerminalConfig
+import com.limer.antigooglity.tools.terminal.TerminalToolExecutor
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.Locale
+
+/**
+ * Deterministic security policy engine evaluating [ToolCall] requests.
+ *
+ * Pipeline: ToolCall -> Security Policy -> Permission Check -> Approval Decision -> Tool Execution
+ *
+ * Security guarantees are divided into three distinct levels:
+ * 1. **Hard Enforcement**: Boundaries that can NEVER be bypassed by any preset or permission
+ *    (Workspace boundary containment, canonical path checks, blocked commands list, null-byte rejection,
+ *    undecodable encoded commands, shell obfuscation, batch script prohibition).
+ * 2. **Permission Enforcement**: Static capability gates defined by [SecurityPermissions]
+ *    (allowReadFile, allowWriteFile, allowDeleteFile, allowExecuteCommand, allowArbitraryCommands).
+ *    Note: when allowDeleteFile=false, file deletion is strictly rejected (DENIED) across all tools and terminals.
+ * 3. **Approval Policy**: Dynamic interaction rules defined by [SecurityPreset]
+ *    (REQUEST_REVIEW, DEFAULT, AUTO, TURBO) determining when user confirmation is required.
+ *
+ * Note on execution model limitations:
+ * The allowlist and argument filters restrict CLI commands, but do NOT provide kernel-level container
+ * isolation. Runtimes capable of arbitrary code execution (Python, Node, Java, Gradle) can perform actions
+ * within the operating system user context. Full OS sandboxing must be provided at the container level.
+ */
+class SecurityPolicy {
+
+    companion object {
+        val FILE_DELETION_COMMANDS: Set<String> = setOf(
+            "rm", "rmdir", "del", "erase", "rd", "remove-item", "ri", "unlink"
+        )
+
+        val DESTRUCTIVE_GIT_SUBCOMMANDS: Set<String> = setOf(
+            "reset", "clean", "restore"
+        )
+
+        val BASE_READ_ONLY_GIT_SUBCOMMANDS: Set<String> = setOf(
+            "status", "diff", "log", "show", "rev-parse", "check-ref-format",
+            "version", "describe", "ls-files", "ls-tree", "shortlog"
+        )
+
+        val MUTATING_GIT_SUBCOMMANDS: Set<String> = setOf(
+            "add", "commit", "stash", "init", "clone", "cherry-pick", "revert",
+            "merge", "rebase", "reset", "clean", "restore", "checkout", "switch",
+            "config", "fetch", "pull", "push", "am", "apply", "bundle", "rm"
+        )
+
+        fun isExternalHelperConfigKey(key: String): Boolean {
+            val k = key.lowercase(Locale.ROOT).trim()
+            return k == "core.fsmonitor" || k.startsWith("core.fsmonitor.") ||
+                k == "core.pager" || k.startsWith("pager.") || k == "pager" ||
+                k == "core.editor" || k == "core.askpass" || k == "core.sshcommand" || k == "sequence.editor" ||
+                k == "diff.external" || (k.startsWith("diff.") && (k.endsWith(".command") || k.endsWith(".textconv"))) ||
+                k.startsWith("filter.") ||
+                k == "credential.helper" || k.startsWith("credential.") ||
+                (k.startsWith("remote.") && (k.endsWith(".receivepack") || k.endsWith(".uploadpack") || k.endsWith(".vcs"))) ||
+                k.startsWith("browser.") ||
+                k == "diff.tool" || k == "merge.tool" || k.startsWith("difftool.") || k.startsWith("mergetool.")
         }
-        commonTest {
-            kotlin.srcDirs("src2/commonTest/kotlin")
-            dependencies {
-                implementation(libs.kotlin.test)
-            }
-        }
-        jvmMain {
-            kotlin.srcDirs("src2/jvmMain/kotlin")
-        }
-        jvmTest {
-            kotlin.srcDirs("src2/jvmTest/kotlin")
-            dependencies {
-                implementation(libs.kotlin.test)
-                implementation("junit:junit:4.13.2")
-            }
-        }
+
+        val SHELL_LAUNCHERS: Set<String> = setOf(
+            "cmd", "powershell", "pwsh", "sh", "bash", "zsh", "ksh", "csh"
+        )
+
+        val WRAPPER_COMMANDS: Set<String> = setOf(
+            "sudo", "doas", "busybox", "env", "nohup", "pkexec", "su", "xargs"
+        )
     }
-}
 
-tasks.register<Exec>("buildWebView2Host") {
-    group = "build"
-    description = "Builds the .NET WebView2 host executable in Release configuration."
-    val projFile = rootProject.file("tools/webview2-host/WebView2Host.csproj")
-
-    val userLocalDotnet = File(System.getenv("LOCALAPPDATA") ?: "", "Microsoft/dotnet/dotnet.exe")
-    val progFilesDotnet = File("C:/Program Files/dotnet/dotnet.exe")
-    val dotnetPath = when {
-        userLocalDotnet.exists() -> userLocalDotnet.absolutePath
-        progFilesDotnet.exists() -> progFilesDotnet.absolutePath
-        else -> "dotnet"
+    enum class GitCategory {
+        READ_ONLY,
+        MUTATING,
+        UNKNOWN
     }
 
-    workingDir = rootProject.projectDir
-    commandLine(dotnetPath, "build", projFile.absolutePath, "-c", "Release")
-}
-
-tasks.register<Test>("geminiRealSmokeTest") {
-    group = "verification"
-    description = "Runs the real Gemini Web smoke test against live Google session (requires manual authorization)."
-    testClassesDirs = tasks.named<Test>("jvmTest").get().testClassesDirs
-    classpath = tasks.named<Test>("jvmTest").get().classpath
-    filter {
-        includeTestsMatching("com.limer.antigooglity.webview2.gemini.GeminiRealSmokeTest")
-    }
-    systemProperty("antigooglity.gemini.real.smoke", "true")
-    environment("ANTIGOOGLITY_GEMINI_REAL_SMOKE", "true")
-}
-
-tasks.register<Exec>("openGeminiBrowser") {
-    group = "antigooglity"
-    description = "Opens visible interactive WebView2 browser window for Google Gemini account authorization and profile switching."
-    dependsOn("buildWebView2Host")
-
-    val hostExe = rootProject.file("tools/webview2-host/bin/Release/net8.0-windows/AntigooglityWebView2Host.exe")
-    val defaultProfile = File(
-        System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home"),
-        "Antigooglity/webview2-profile"
+    data class GitParsedInvocation(
+        val subcommand: String?,
+        val subcommandArgs: List<String>,
+        val configs: List<String>,
+        val definesAlias: Boolean,
+        val aliasDefinesShellOrDeletion: Boolean,
+        val hasOpaqueConfigEnvAlias: Boolean = false,
+        val hasExternalHelperConfig: Boolean = false,
+        val externalHelperConfigKeys: List<String> = emptyList(),
+        val category: GitCategory = GitCategory.UNKNOWN,
+        val isAmbiguousGlobalOptions: Boolean = false,
     )
 
-    val dotnetRoot = System.getenv("DOTNET_ROOT")
-        ?: "${System.getProperty("user.home")}\\AppData\\Local\\Microsoft\\dotnet"
-    if (File(dotnetRoot).isDirectory) {
-        environment("DOTNET_ROOT", dotnetRoot)
-        val path = System.getenv("PATH") ?: ""
-        environment("PATH", "$dotnetRoot;$path")
-    }
-
-    commandLine(
-        hostExe.absolutePath,
-        "--visible-browser",
-        "--user-data-dir=${defaultProfile.absolutePath}",
-        "--initial-url=https://gemini.google.com"
+    data class ParsedCommandChain(
+        val effectiveCommand: String,
+        val effectiveNormalized: String,
+        val effectiveArgs: List<String>,
+        val isWrapped: Boolean,
+        val wrappers: List<String>,
+        val isAmbiguousWrapper: Boolean = false,
     )
 
-    doFirst {
-        if (!hostExe.exists()) {
-            throw GradleException("WebView2 host executable not found at: ${hostExe.absolutePath} after building.")
+    data class XargsParseResult(
+        val target: String?,
+        val targetArgs: List<String>,
+        val isAmbiguous: Boolean,
+    )
+
+    internal fun parseGitConfigContent(
+        content: String,
+        baseDir: Path? = null,
+        visited: MutableSet<Path> = mutableSetOf(),
+        depth: Int = 0,
+    ): Pair<Map<String, String>, Boolean> {
+        val result = mutableMapOf<String, String>()
+        var currentSection = ""
+        var hasUnresolvedInclude = false
+
+        for (rawLine in content.lines()) {
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) continue
+            if (line.startsWith("[") && line.endsWith("]")) {
+                val sectionContent = line.substring(1, line.length - 1).trim()
+                if (sectionContent.contains('"')) {
+                    val secName = sectionContent.substringBefore('"').trim().lowercase(Locale.ROOT)
+                    val subSec = sectionContent.substringAfter('"').substringBeforeLast('"').trim()
+                    currentSection = "$secName.$subSec"
+                } else {
+                    currentSection = sectionContent.lowercase(Locale.ROOT)
+                }
+                continue
+            }
+            if (line.contains("=")) {
+                val key = line.substringBefore("=").trim().lowercase(Locale.ROOT)
+                val value = line.substringAfter("=").trim()
+                val fullKey = if (currentSection.isNotEmpty()) "$currentSection.$key" else key
+                result[fullKey] = value
+
+                if (fullKey == "include.path" || (fullKey.startsWith("includeif.") && fullKey.endsWith(".path"))) {
+                    val incPathStr = value.removeSurrounding("\"").removeSurrounding("'").trim()
+                    if (incPathStr.isNotEmpty() && depth < 10) {
+                        try {
+                            val targetPath = when {
+                                incPathStr.startsWith("~/") -> {
+                                    val home = System.getProperty("user.home") ?: ""
+                                    if (home.isNotBlank()) Path.of(home, incPathStr.removePrefix("~/")) else null
+                                }
+                                Path.of(incPathStr).isAbsolute -> Path.of(incPathStr)
+                                baseDir != null -> baseDir.resolve(incPathStr).normalize()
+                                else -> null
+                            }
+
+                            if (targetPath != null && Files.isRegularFile(targetPath)) {
+                                val norm = targetPath.toAbsolutePath().normalize()
+                                if (norm !in visited) {
+                                    visited.add(norm)
+                                    val subContent = Files.readString(norm)
+                                    val (subEntries, subUnres) = parseGitConfigContent(subContent, norm.parent, visited, depth + 1)
+                                    result.putAll(subEntries)
+                                    if (subUnres) hasUnresolvedInclude = true
+                                }
+                            } else {
+                                hasUnresolvedInclude = true
+                            }
+                        } catch (_: Exception) {
+                            hasUnresolvedInclude = true
+                        }
+                    } else if (incPathStr.isNotEmpty()) {
+                        hasUnresolvedInclude = true
+                    }
+                }
+            }
         }
-        defaultProfile.mkdirs()
-        println("Launching visible interactive Gemini browser session...")
-        println("Profile directory: ${defaultProfile.absolutePath}")
-        println("Close the browser window when finished to complete this task.")
+        return Pair(result, hasUnresolvedInclude)
+    }
+
+    internal fun parseGitConfigFile(
+        file: Path,
+        visited: MutableSet<Path> = mutableSetOf(),
+        depth: Int = 0,
+    ): Pair<Map<String, String>, Boolean> {
+        if (!Files.isRegularFile(file)) return Pair(emptyMap(), false)
+        val norm = file.toAbsolutePath().normalize()
+        if (norm in visited) return Pair(emptyMap(), false)
+        visited.add(norm)
+        return try {
+            val content = Files.readString(norm)
+            parseGitConfigContent(content, norm.parent, visited, depth)
+        } catch (_: Exception) {
+            Pair(emptyMap(), true)
+        }
+    }
+
+    internal fun findAndParseGitConfig(startDir: Path, workspaceRoot: Path): Pair<Map<String, String>, Boolean> {
+        var curr: Path? = startDir
+        val merged = mutableMapOf<String, String>()
+        var hasUnres = false
+
+        while (curr != null) {
+            val dotGit = curr.resolve(".git")
+            if (Files.isDirectory(dotGit)) {
+                val configFile = dotGit.resolve("config")
+                if (Files.isRegularFile(configFile)) {
+                    val (entries, unres) = parseGitConfigFile(configFile)
+                    merged.putAll(entries)
+                    if (unres) hasUnres = true
+                }
+                val worktreeConfigFile = dotGit.resolve("config.worktree")
+                if (Files.isRegularFile(worktreeConfigFile)) {
+                    val (entries, unres) = parseGitConfigFile(worktreeConfigFile)
+                    merged.putAll(entries)
+                    if (unres) hasUnres = true
+                }
+                return Pair(merged, hasUnres)
+            } else if (Files.isRegularFile(dotGit)) {
+                try {
+                    val line = Files.readAllLines(dotGit).firstOrNull()?.trim() ?: ""
+                    if (line.startsWith("gitdir:")) {
+                        val gitDirStr = line.removePrefix("gitdir:").trim()
+                        val gitDirPath = curr.resolve(gitDirStr).normalize()
+                        val configFile = gitDirPath.resolve("config")
+                        if (Files.isRegularFile(configFile)) {
+                            val (entries, unres) = parseGitConfigFile(configFile)
+                            merged.putAll(entries)
+                            if (unres) hasUnres = true
+                        }
+                        val worktreeConfig = gitDirPath.resolve("config.worktree")
+                        if (Files.isRegularFile(worktreeConfig)) {
+                            val (entries, unres) = parseGitConfigFile(worktreeConfig)
+                            merged.putAll(entries)
+                            if (unres) hasUnres = true
+                        }
+                        val commonDirFile = gitDirPath.resolve("commondir")
+                        if (Files.isRegularFile(commonDirFile)) {
+                            val commonDirStr = Files.readString(commonDirFile).trim()
+                            val commonDirPath = gitDirPath.resolve(commonDirStr).normalize()
+                            val commonConfig = commonDirPath.resolve("config")
+                            if (Files.isRegularFile(commonConfig)) {
+                                val (entries, unres) = parseGitConfigFile(commonConfig)
+                                merged.putAll(entries)
+                                if (unres) hasUnres = true
+                            }
+                        }
+                        return Pair(merged, hasUnres)
+                    }
+                } catch (_: Exception) {
+                    return Pair(emptyMap(), true)
+                }
+            }
+            if (curr == workspaceRoot || curr.parent == null) break
+            curr = curr.parent
+        }
+        return Pair(emptyMap(), false)
+    }
+
+    internal fun parseUserGitConfig(
+        userConfigPath: Path?,
+        env: Map<String, String>,
+    ): Pair<Map<String, String>, Boolean> {
+        val envGlobal = env["GIT_CONFIG_GLOBAL"]
+        if (!envGlobal.isNullOrBlank()) {
+            return parseGitConfigFile(Path.of(envGlobal))
+        }
+        if (userConfigPath != null) {
+            return parseGitConfigFile(userConfigPath)
+        }
+        return Pair(emptyMap(), false)
+    }
+
+    internal fun parseSystemGitConfig(
+        systemConfigPath: Path?,
+        env: Map<String, String>,
+    ): Pair<Map<String, String>, Boolean> {
+        val noSystem = env["GIT_CONFIG_NOSYSTEM"]?.trim()?.lowercase(Locale.ROOT)
+        if (noSystem == "1" || noSystem == "true" || noSystem == "yes") {
+            return Pair(emptyMap(), false)
+        }
+        val envSystem = env["GIT_CONFIG_SYSTEM"]
+        if (!envSystem.isNullOrBlank()) {
+            return parseGitConfigFile(Path.of(envSystem))
+        }
+        if (systemConfigPath != null) {
+            return parseGitConfigFile(systemConfigPath)
+        }
+        return Pair(emptyMap(), false)
+    }
+
+    fun evaluate(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+        env: Map<String, String> = System.getenv(),
+        userConfigPath: Path? = null,
+        systemConfigPath: Path? = null,
+    ): SecurityDecision {
+        return when (call.name) {
+            "read_file" -> evaluateReadFile(call, permissions, preset, workspaceRoot)
+            "list_directory" -> evaluateListDirectory(call, permissions, preset, workspaceRoot)
+            "write_file" -> evaluateWriteFile(call, permissions, preset, workspaceRoot)
+            "create_directory" -> evaluateCreateDirectory(call, permissions, preset, workspaceRoot)
+            "delete_file" -> evaluateDeleteFile(call, permissions, preset, workspaceRoot)
+            "execute_command" -> evaluateExecuteCommand(call, permissions, preset, workspaceRoot, env, userConfigPath, systemConfigPath)
+            else -> SecurityDecision(
+                kind = SecurityDecisionKind.UNKNOWN_TOOL,
+                reason = "Unknown tool '${call.name}' is not recognized or supported by security policy",
+            )
+        }
+    }
+
+    private fun evaluateReadFile(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowReadFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Reading files is disabled in security permissions",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "read_file",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for reading file '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO,
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateListDirectory(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowReadFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Reading/listing directory contents is disabled in security permissions",
+            )
+        }
+
+        val pathStr = extractPathArg(call) ?: "."
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "list_directory",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for listing directory '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO,
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateWriteFile(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowWriteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Writing files is disabled in security permissions",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "write_file",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        val fileAlreadyExists = try {
+            val resolver = WorkspacePathResolver(workspaceRoot)
+            val resolved = resolver.resolve(pathStr, mustExist = false)
+            Files.exists(resolved)
+        } catch (_: Exception) {
+            false
+        }
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for writing file '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT -> SecurityDecision(
+                // Preserves baseline agent behavior: file write operations run directly
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+            SecurityPreset.AUTO -> {
+                // Auto mode: overwriting existing file requires review; creating new file is low-risk
+                if (fileAlreadyExists) {
+                    SecurityDecision(
+                        kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                        reason = "Auto mode: overwriting existing file '$pathStr' requires user review",
+                        approvalCommand = approvalCmd,
+                    )
+                } else {
+                    SecurityDecision(
+                        kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+                    )
+                }
+            }
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateCreateDirectory(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowWriteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Creating directories is disabled in security permissions (requires write permission)",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "create_directory",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for creating directory '$pathStr'",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO,
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateDeleteFile(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+    ): SecurityDecision {
+        if (!permissions.allowDeleteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Deleting files is disabled in security permissions (allowDeleteFile=false)",
+            )
+        }
+
+        val pathStr = extractPathArg(call)
+            ?: return SecurityDecision(SecurityDecisionKind.DENIED, "Missing required argument 'path'")
+
+        val pathCheck = validatePathBoundary(pathStr, workspaceRoot, mustExist = false)
+        if (pathCheck != null) return pathCheck
+
+        val approvalCmd = TerminalCommand(
+            command = "delete_file",
+            args = listOf(pathStr),
+            workingDirectory = ".",
+        )
+
+        return when (preset) {
+            SecurityPreset.REQUEST_REVIEW,
+            SecurityPreset.DEFAULT,
+            SecurityPreset.AUTO -> SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Deleting files is a sensitive operation requiring user confirmation",
+                approvalCommand = approvalCmd,
+            )
+            SecurityPreset.TURBO -> SecurityDecision(
+                kind = SecurityDecisionKind.ALLOWED_IMMEDIATE,
+            )
+        }
+    }
+
+    private fun evaluateExecuteCommand(
+        call: ToolCall,
+        permissions: SecurityPermissions,
+        preset: SecurityPreset,
+        workspaceRoot: Path,
+        env: Map<String, String> = System.getenv(),
+        userConfigPath: Path? = null,
+        systemConfigPath: Path? = null,
+    ): SecurityDecision {
+        if (!permissions.allowExecuteCommand) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Executing terminal commands is disabled in security permissions",
+            )
+        }
+
+        val cmd = try {
+            TerminalToolExecutor.parseCommand(call.arguments)
+        } catch (e: Exception) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Invalid command JSON arguments: ${e.message}",
+            )
+        }
+
+        val raw = cmd.command.trim()
+        if (raw.isEmpty()) {
+            return SecurityDecision(SecurityDecisionKind.DENIED, "Command name must not be empty")
+        }
+        if (raw.contains('\u0000')) {
+            return SecurityDecision(SecurityDecisionKind.DENIED, "Null byte detected in command string")
+        }
+
+        // Validate batch scripts on Windows
+        val isWindows = System.getProperty("os.name")?.lowercase(Locale.ROOT)?.contains("win") == true
+        val lowerRaw = raw.lowercase(Locale.ROOT)
+        if (isWindows && (lowerRaw.endsWith(".bat") || lowerRaw.endsWith(".cmd"))) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Execution of Windows batch scripts (.bat, .cmd) is disabled by security policy",
+            )
+        }
+
+        // Validate working directory containment
+        val wdCheck = validatePathBoundary(cmd.workingDirectory, workspaceRoot, mustExist = false)
+        if (wdCheck != null) return wdCheck
+
+        val cmdName = Path.of(raw.replace('\\', '/')).fileName?.toString() ?: raw
+        val normalizedName = if (isWindows) {
+            cmdName.lowercase(Locale.ROOT).removeSuffix(".exe").removeSuffix(".cmd").removeSuffix(".bat")
+        } else {
+            cmdName
+        }
+
+        // Unwrap wrapper commands (sudo, doas, env, busybox, nohup, pkexec, su, xargs)
+        val unwrapped = unwrapCommand(cmdName, normalizedName, cmd.args)
+        val effCmdName = unwrapped.effectiveCommand
+        val effNormalized = unwrapped.effectiveNormalized
+        val effArgs = unwrapped.effectiveArgs
+        val isWrapped = unwrapped.isWrapped
+
+        // 1. Strictly blocked commands (hard boundary in all presets)
+        if (cmdName in TerminalConfig.DEFAULT_BLOCKED_COMMANDS ||
+            normalizedName in TerminalConfig.DEFAULT_BLOCKED_COMMANDS ||
+            effCmdName in TerminalConfig.DEFAULT_BLOCKED_COMMANDS ||
+            effNormalized in TerminalConfig.DEFAULT_BLOCKED_COMMANDS
+        ) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Command '$raw' is strictly forbidden by terminal security policy",
+            )
+        }
+
+        // Ambiguous wrapper invocation (e.g. xargs with unrecognized flags or missing command)
+        if (unwrapped.isAmbiguousWrapper) {
+            if (!permissions.allowDeleteFile) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Ambiguous or unrecognized wrapper arguments cannot be verified safe when allowDeleteFile=false",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Ambiguous wrapper invocation '${cmd.command}' requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // Check if shell launcher arguments contain blocked commands or obfuscations
+        val isShellLauncher = normalizedName in SHELL_LAUNCHERS || effNormalized in SHELL_LAUNCHERS
+        val shellTokens = if (isShellLauncher) {
+            val (shellBlockedDecision, tokens) = inspectShellLauncher(cmd)
+            if (shellBlockedDecision != null) {
+                return shellBlockedDecision
+            }
+            tokens
+        } else {
+            emptySet()
+        }
+
+        // Check command substitution in shell launchers when deletion is disabled
+        if (isShellLauncher && !permissions.allowDeleteFile) {
+            val hasSubstitution = cmd.args.any { it.contains("$(") || it.contains("`") }
+            if (hasSubstitution) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Shell launcher with command substitution cannot be verified safe when allowDeleteFile is disabled",
+                )
+            }
+        }
+
+        // Parse Git arguments if git
+        val isGit = normalizedName == "git" || effNormalized == "git"
+        val rawGitInvocation = if (isGit) {
+            parseGitArgs(if (effNormalized == "git") effArgs else cmd.args)
+        } else {
+            null
+        }
+
+        val parsedGit = if (isGit && rawGitInvocation != null) {
+            val envHelperKeys = mutableListOf<String>()
+            var envAliasDefinesDeletion = false
+
+            val gitExtDiff = env["GIT_EXTERNAL_DIFF"]
+            if (!gitExtDiff.isNullOrBlank()) envHelperKeys.add("GIT_EXTERNAL_DIFF")
+
+            val gitSsh = env["GIT_SSH_COMMAND"] ?: env["GIT_SSH"]
+            if (!gitSsh.isNullOrBlank()) envHelperKeys.add("GIT_SSH_COMMAND")
+
+            val gitAskPass = env["GIT_ASKPASS"] ?: env["SSH_ASKPASS"]
+            if (!gitAskPass.isNullOrBlank()) envHelperKeys.add("GIT_ASKPASS")
+
+            val gitPager = env["GIT_PAGER"] ?: env["PAGER"]
+            if (!gitPager.isNullOrBlank()) {
+                val pagerVal = gitPager.trim().lowercase(Locale.ROOT)
+                if (pagerVal != "cat" && pagerVal != "false") {
+                    envHelperKeys.add(if (env.containsKey("GIT_PAGER")) "GIT_PAGER" else "PAGER")
+                }
+            }
+
+            val gitConfigParams = env["GIT_CONFIG_PARAMETERS"]
+            if (!gitConfigParams.isNullOrBlank()) {
+                envHelperKeys.add("GIT_CONFIG_PARAMETERS")
+                val paramsLower = gitConfigParams.lowercase(Locale.ROOT)
+                if (paramsLower.contains("alias.") && (paramsLower.contains("!") || paramsLower.contains("clean") || paramsLower.contains("rm"))) {
+                    envAliasDefinesDeletion = true
+                }
+            }
+
+            val gitConfigCount = env["GIT_CONFIG_COUNT"]?.toIntOrNull() ?: 0
+            for (c in 0 until gitConfigCount) {
+                val k = env["GIT_CONFIG_KEY_$c"]
+                val v = env["GIT_CONFIG_VALUE_$c"] ?: ""
+                if (!k.isNullOrBlank()) {
+                    if (isExternalHelperConfigKey(k)) {
+                        envHelperKeys.add(k)
+                    }
+                    if (k.lowercase(Locale.ROOT).startsWith("alias.")) {
+                        val valLower = v.lowercase(Locale.ROOT).trim()
+                        val isShell = v.trim().startsWith("!")
+                        val targetFirstWord = v.removePrefix("!").trim().split(Regex("\\s+")).firstOrNull()?.lowercase(Locale.ROOT) ?: ""
+                        val isGitClean = targetFirstWord == "clean"
+                        val isGitRm = targetFirstWord == "rm" && !valLower.contains("--cached")
+                        val isDelWord = FILE_DELETION_COMMANDS.any { del -> valLower.contains("\\b$del\\b".toRegex()) || valLower.contains(del) }
+                        val isBlockedWord = TerminalConfig.DEFAULT_BLOCKED_COMMANDS.any { b -> valLower.contains(b) }
+                        if (isShell || isGitClean || isGitRm || isDelWord || isBlockedWord) {
+                            envAliasDefinesDeletion = true
+                        }
+                    }
+                }
+            }
+
+            val effectiveWorkingDir = try {
+                val workDirStr = cmd.workingDirectory.trim()
+                if (workDirStr.isEmpty() || workDirStr == ".") {
+                    workspaceRoot
+                } else {
+                    workspaceRoot.resolve(workDirStr).normalize()
+                }
+            } catch (_: Exception) {
+                workspaceRoot
+            }
+
+            val (repoConfig, repoUnres) = findAndParseGitConfig(effectiveWorkingDir, workspaceRoot)
+            val (userConfig, userUnres) = parseUserGitConfig(userConfigPath, env)
+            val (systemConfig, systemUnres) = parseSystemGitConfig(systemConfigPath, env)
+            val allConfigs = systemConfig + userConfig + repoConfig
+            val hasUnresolvedInclude = repoUnres || userUnres || systemUnres
+
+            val configHelperKeys = mutableListOf<String>()
+            var configAliasDefinesDeletion = false
+
+            if (hasUnresolvedInclude) {
+                configHelperKeys.add("unresolved_include")
+            }
+
+            for ((k, v) in allConfigs) {
+                if (isExternalHelperConfigKey(k) && v.isNotBlank() && v.lowercase(Locale.ROOT) != "false" && v.lowercase(Locale.ROOT) != "cat") {
+                    if (k !in configHelperKeys) configHelperKeys.add(k)
+                }
+                if (k.startsWith("alias.")) {
+                    val valLower = v.lowercase(Locale.ROOT).trim()
+                    val isShell = v.trim().startsWith("!")
+                    val targetFirstWord = v.removePrefix("!").trim().split(Regex("\\s+")).firstOrNull()?.lowercase(Locale.ROOT) ?: ""
+                    val isGitClean = targetFirstWord == "clean"
+                    val isGitRm = targetFirstWord == "rm" && !valLower.contains("--cached")
+                    val isDelWord = FILE_DELETION_COMMANDS.any { del -> valLower.contains("\\b$del\\b".toRegex()) || valLower.contains(del) }
+                    val isBlockedWord = TerminalConfig.DEFAULT_BLOCKED_COMMANDS.any { b -> valLower.contains(b) }
+                    if (isShell || isGitClean || isGitRm || isDelWord || isBlockedWord) {
+                        configAliasDefinesDeletion = true
+                    }
+                }
+            }
+
+            val hasExternalHelper = rawGitInvocation.hasExternalHelperConfig || envHelperKeys.isNotEmpty() || configHelperKeys.isNotEmpty() || hasUnresolvedInclude
+            val allExternalHelperKeys = (rawGitInvocation.externalHelperConfigKeys + envHelperKeys + configHelperKeys).distinct()
+            val aliasDefinesDeletion = rawGitInvocation.aliasDefinesShellOrDeletion || configAliasDefinesDeletion || envAliasDefinesDeletion
+
+            rawGitInvocation.copy(
+                hasExternalHelperConfig = hasExternalHelper,
+                externalHelperConfigKeys = allExternalHelperKeys,
+                aliasDefinesShellOrDeletion = aliasDefinesDeletion,
+            )
+        } else {
+            null
+        }
+
+        // Ambiguous or malformed Git global options
+        if (parsedGit != null && parsedGit.isAmbiguousGlobalOptions) {
+            if (!permissions.allowDeleteFile) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Ambiguous or incomplete Git global options cannot be verified safe when allowDeleteFile=false",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Ambiguous Git invocation requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // 2. Check file deletion via terminal (hard boundary when allowDeleteFile=false)
+        val isDeletionCommand = isTerminalDeletionCommand(normalizedName, cmd, shellTokens, parsedGit) ||
+            (isWrapped && isTerminalDeletionCommand(effNormalized, TerminalCommand(effCmdName, effArgs, cmd.workingDirectory), shellTokens, parsedGit))
+
+        if (isDeletionCommand && !permissions.allowDeleteFile) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Deleting files via terminal is disabled in security permissions (allowDeleteFile=false)",
+            )
+        }
+
+        // 3. Check destructive Git operations
+        val isDestructiveGit = if (isGit && parsedGit != null) {
+            isDestructiveGitCommand("git", cmd, parsedGit)
+        } else {
+            false
+        }
+
+        // Categorize Git commands
+        val isMutatingGit = isGit && parsedGit != null && parsedGit.category == GitCategory.MUTATING
+        val isUnknownGit = isGit && parsedGit != null && parsedGit.category == GitCategory.UNKNOWN
+
+        // 4. Check dangerous commands
+        val isDangerous = isDangerousCommand(
+            cmdName = cmdName,
+            normalizedName = normalizedName,
+            cmd = cmd,
+            isDestructiveGit = isDestructiveGit,
+            isDeletion = isDeletionCommand,
+            isWrapped = isWrapped,
+            parsedGit = parsedGit,
+        )
+
+        val isAllowlisted = (cmdName in TerminalConfig.DEFAULT_ALLOWED_COMMANDS ||
+            normalizedName in TerminalConfig.DEFAULT_ALLOWED_COMMANDS) && !isWrapped
+
+        // In Turbo mode:
+        if (preset == SecurityPreset.TURBO) {
+            if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+                )
+            }
+            if (isDestructiveGit) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Destructive Git operation '${cmd.command}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isDeletionCommand) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Terminal file deletion command '${cmd.command}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isShellLauncher) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Shell launcher '${cmd.command}' requires user confirmation in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isMutatingGit) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Mutating Git operation '${cmd.command} ${parsedGit.subcommand}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isUnknownGit) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Unknown Git subcommand or alias '${parsedGit.subcommand}' requires user confirmation in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (parsedGit != null && parsedGit.definesAlias) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Git invocation defining or modifying aliases requires user confirmation in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (parsedGit != null && parsedGit.hasExternalHelperConfig) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Git command specifies or inherits external helper/program configuration (${parsedGit.externalHelperConfigKeys.joinToString(", ")}) requiring user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            if (isDangerous) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                    reason = "Dangerous command '${cmd.command}' requires user confirmation even in Turbo mode",
+                    approvalCommand = cmd,
+                )
+            }
+            return SecurityDecision(kind = SecurityDecisionKind.ALLOWED_IMMEDIATE)
+        }
+
+        // In Request Review mode: every permitted command requires confirmation
+        if (preset == SecurityPreset.REQUEST_REVIEW) {
+            if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Request Review mode: confirmation required for command '${cmd.command}'",
+                approvalCommand = cmd,
+            )
+        }
+
+        // In Auto mode:
+        // Command execution does not automatically execute; requires confirmation
+        if (preset == SecurityPreset.AUTO) {
+            if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+                return SecurityDecision(
+                    kind = SecurityDecisionKind.DENIED,
+                    reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+                )
+            }
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Auto mode: terminal command '${cmd.command}' requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // In Default mode:
+        // Shell launchers ALWAYS require confirmation in Default mode regardless of requireApprovalForDangerous
+        if (isShellLauncher) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Shell launcher '${cmd.command}' requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        // Mutating Git operations, unknown subcommands, and alias definitions ALWAYS require confirmation
+        if (isMutatingGit) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Mutating Git operation '${cmd.command} ${parsedGit.subcommand}' requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (isUnknownGit) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Unknown Git subcommand or alias '${parsedGit.subcommand}' requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (parsedGit != null && parsedGit.definesAlias) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Git invocation defining or modifying aliases requires user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (parsedGit != null && parsedGit.hasExternalHelperConfig) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Git command specifies or inherits external helper/program configuration (${parsedGit.externalHelperConfigKeys.joinToString(", ")}) requiring user confirmation in Default mode",
+                approvalCommand = cmd,
+            )
+        }
+
+        if (isDangerous && permissions.requireApprovalForDangerous) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.REQUIRES_APPROVAL,
+                reason = "Command '${cmd.command}' is marked as dangerous and requires user confirmation",
+                approvalCommand = cmd,
+            )
+        }
+
+        // Safe command: check allowlist
+        if (!permissions.allowArbitraryCommands && !isAllowlisted) {
+            return SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Command '$raw' is not in the allowed commands list and allowArbitraryCommands is disabled",
+            )
+        }
+
+        return SecurityDecision(kind = SecurityDecisionKind.ALLOWED_IMMEDIATE)
+    }
+
+    private fun inspectShellLauncher(cmd: TerminalCommand): Pair<SecurityDecision?, Set<String>> {
+        val extractedTokens = mutableSetOf<String>()
+        val textSnippets = mutableListOf<String>()
+
+        var i = 0
+        while (i < cmd.args.size) {
+            val arg = cmd.args[i]
+
+            // Check for PowerShell encoded command flags (-e, -enc, -Encoded, -EncodedCommand, etc.)
+            val encMatch = Regex("^-(?:e|enc|enco|encod|encode|encoded|encodedcommand)(?:[:=](.+))?$", RegexOption.IGNORE_CASE).find(arg)
+            if (encMatch != null) {
+                val inlinePayload = encMatch.groupValues[1]
+                val base64Payload = if (inlinePayload.isNotEmpty()) {
+                    inlinePayload
+                } else if (i + 1 < cmd.args.size) {
+                    i++
+                    cmd.args[i]
+                } else {
+                    null
+                }
+
+                if (base64Payload != null) {
+                    val decodedText = try {
+                        val bytes = java.util.Base64.getDecoder().decode(base64Payload.trim())
+                        // PowerShell uses UTF-16LE for encoded commands
+                        val utf16 = String(bytes, java.nio.charset.StandardCharsets.UTF_16LE).trim()
+                        if (utf16.any { it != '\u0000' && it.isDefined() }) {
+                            utf16
+                        } else {
+                            String(bytes, java.nio.charset.StandardCharsets.UTF_8).trim()
+                        }
+                    } catch (_: Exception) {
+                        return Pair(
+                            SecurityDecision(
+                                kind = SecurityDecisionKind.DENIED,
+                                reason = "Undecodable or invalid encoded shell command argument",
+                            ),
+                            emptySet(),
+                        )
+                    }
+                    textSnippets.add(decodedText)
+                }
+            } else {
+                textSnippets.add(arg)
+            }
+            i++
+        }
+
+        // Collect tokens from raw args and decoded snippets
+        for (snippet in textSnippets) {
+            val lowerSnippet = snippet.lowercase(Locale.ROOT)
+            for (blocked in TerminalConfig.DEFAULT_BLOCKED_COMMANDS) {
+                if (lowerSnippet.contains("\\b$blocked\\b".toRegex()) || lowerSnippet.contains(blocked)) {
+                    return Pair(
+                        SecurityDecision(
+                            kind = SecurityDecisionKind.DENIED,
+                            reason = "Shell launcher argument contains strictly forbidden command: $blocked",
+                        ),
+                        emptySet(),
+                    )
+                }
+            }
+
+            // Check unquoted and unescaped version to defeat obfuscation (e.g. f"o"r"m"a"t, f\ormat, r\m)
+            val unescaped = snippet.replace("\\", "").replace("\"", "").replace("'", "")
+            val unescapedLower = unescaped.lowercase(Locale.ROOT)
+            for (blocked in TerminalConfig.DEFAULT_BLOCKED_COMMANDS) {
+                if (unescapedLower.contains("\\b$blocked\\b".toRegex()) || unescapedLower.contains(blocked)) {
+                    return Pair(
+                        SecurityDecision(
+                            kind = SecurityDecisionKind.DENIED,
+                            reason = "Shell launcher argument contains obfuscated forbidden command: $blocked",
+                        ),
+                        emptySet(),
+                    )
+                }
+            }
+
+            // Split into individual tokens for deletion / subcommand inspection
+            val tokens = unescaped.split(Regex("[\\s;&|`$<>(){}]+"))
+            for (t in tokens) {
+                val clean = t.trim().lowercase(Locale.ROOT)
+                if (clean.isNotEmpty()) {
+                    extractedTokens.add(clean)
+                }
+            }
+        }
+
+        return Pair(null, extractedTokens)
+    }
+
+    private fun parseGitArgs(args: List<String>): GitParsedInvocation {
+        val optionsWithSeparateArg = setOf(
+            "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"
+        )
+        val configs = mutableListOf<String>()
+        var subcmd: String? = null
+        var subArgs = emptyList<String>()
+        var definesAlias = false
+        var aliasDefinesShellOrDeletion = false
+        var hasOpaqueConfigEnvAlias = false
+        var hasExternalHelperConfig = false
+        val externalHelperConfigKeys = mutableListOf<String>()
+        var isAmbiguousGlobalOptions = false
+        var hasVersionFlag = false
+        var i = 0
+
+        while (i < args.size) {
+            val arg = args[i]
+
+            // Check --config-env option
+            if (arg == "--config-env") {
+                if (i + 1 < args.size) {
+                    val cfg = args[i + 1]
+                    configs.add(cfg)
+                    val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT).trim()
+                    if (cfgKey.startsWith("alias.") || cfgKey.contains("alias.")) {
+                        definesAlias = true
+                        hasOpaqueConfigEnvAlias = true
+                        aliasDefinesShellOrDeletion = true
+                    }
+                    if (isExternalHelperConfigKey(cfgKey)) {
+                        hasExternalHelperConfig = true
+                        if (cfgKey !in externalHelperConfigKeys) externalHelperConfigKeys.add(cfgKey)
+                    }
+                    i += 2
+                    continue
+                } else {
+                    isAmbiguousGlobalOptions = true
+                    break
+                }
+            } else if (arg.startsWith("--config-env=")) {
+                val cfg = arg.substringAfter("=")
+                configs.add(cfg)
+                val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT).trim()
+                if (cfgKey.startsWith("alias.") || cfgKey.contains("alias.")) {
+                    definesAlias = true
+                    hasOpaqueConfigEnvAlias = true
+                    aliasDefinesShellOrDeletion = true
+                }
+                if (isExternalHelperConfigKey(cfgKey)) {
+                    hasExternalHelperConfig = true
+                    if (cfgKey !in externalHelperConfigKeys) externalHelperConfigKeys.add(cfgKey)
+                }
+                i++
+                continue
+            }
+
+            // Check -c config option
+            if (arg == "-c") {
+                if (i + 1 < args.size) {
+                    val cfg = args[i + 1]
+                    configs.add(cfg)
+                    val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT).trim()
+                    if (isExternalHelperConfigKey(cfgKey)) {
+                        hasExternalHelperConfig = true
+                        if (cfgKey !in externalHelperConfigKeys) externalHelperConfigKeys.add(cfgKey)
+                    }
+                    i += 2
+                    continue
+                } else {
+                    isAmbiguousGlobalOptions = true
+                    break
+                }
+            } else if (arg.startsWith("-c") && arg.length > 2 && !arg.startsWith("--")) {
+                val cfg = arg.substring(2)
+                configs.add(cfg)
+                val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT).trim()
+                if (isExternalHelperConfigKey(cfgKey)) {
+                    hasExternalHelperConfig = true
+                    if (cfgKey !in externalHelperConfigKeys) externalHelperConfigKeys.add(cfgKey)
+                }
+                i++
+                continue
+            }
+
+            // Check version flags
+            if (arg == "-v" || arg == "--version") {
+                hasVersionFlag = true
+            }
+
+            // Options taking a separate argument
+            if (arg in optionsWithSeparateArg) {
+                if (i + 1 < args.size) {
+                    i += 2
+                    continue
+                } else {
+                    isAmbiguousGlobalOptions = true
+                    break
+                }
+            }
+
+            // Options with inline argument =
+            if (arg.startsWith("--") && arg.contains("=")) {
+                i++
+                continue
+            }
+
+            // Standalone flags like --no-pager or --exec-path or -p
+            if (arg.startsWith("-")) {
+                i++
+                continue
+            }
+
+            // First non-option token is the subcommand
+            subcmd = arg.lowercase(Locale.ROOT)
+            subArgs = if (i + 1 < args.size) args.subList(i + 1, args.size) else emptyList()
+            break
+        }
+
+        // Analyze configs for alias definitions, external helpers, and dangerous commands
+        for (cfg in configs) {
+            val cfgKey = cfg.substringBefore("=").lowercase(Locale.ROOT).trim()
+            val valPart = cfg.substringAfter("=", "").trim()
+            val valLower = valPart.lowercase(Locale.ROOT)
+
+            if (isExternalHelperConfigKey(cfgKey)) {
+                hasExternalHelperConfig = true
+                if (cfgKey !in externalHelperConfigKeys) {
+                    externalHelperConfigKeys.add(cfgKey)
+                }
+            }
+
+            if (cfgKey.startsWith("alias.") || cfgKey.startsWith("alias")) {
+                definesAlias = true
+                val targetFirstWord = valLower.removePrefix("!").trim().split(Regex("\\s+")).firstOrNull() ?: ""
+                val isShell = valPart.startsWith("!")
+                val isGitClean = targetFirstWord == "clean"
+                val isGitRm = targetFirstWord == "rm" && !valLower.contains("--cached")
+                val isDelWord = FILE_DELETION_COMMANDS.any { del ->
+                    valLower.contains("\\b$del\\b".toRegex()) || valLower.contains(del)
+                }
+                val isBlockedWord = TerminalConfig.DEFAULT_BLOCKED_COMMANDS.any { b -> valLower.contains(b) }
+                if (isShell || isGitClean || isGitRm || isDelWord || isBlockedWord) {
+                    aliasDefinesShellOrDeletion = true
+                }
+            }
+        }
+
+        // Also check if subcommand is "config" and modifies an alias or external helper
+        if (subcmd == "config") {
+            val fullConfigArgs = subArgs.joinToString(" ").lowercase(Locale.ROOT)
+            if (fullConfigArgs.contains("alias.") || fullConfigArgs.contains("alias ")) {
+                definesAlias = true
+                val targetTokens = subArgs.drop(1).joinToString(" ").lowercase(Locale.ROOT)
+                val targetFirstWord = targetTokens.removePrefix("!").trim().split(Regex("\\s+")).firstOrNull() ?: ""
+                val isShell = targetTokens.contains("!")
+                val isGitClean = targetFirstWord == "clean" || targetTokens.contains("clean ") || targetTokens.endsWith("clean")
+                val isGitRm = (targetFirstWord == "rm" || targetTokens.contains("rm ")) && !targetTokens.contains("--cached")
+                val isDelWord = FILE_DELETION_COMMANDS.any { del -> fullConfigArgs.contains("\\b$del\\b".toRegex()) }
+                val isBlockedWord = TerminalConfig.DEFAULT_BLOCKED_COMMANDS.any { b -> fullConfigArgs.contains(b) }
+                if (isShell || isGitClean || isGitRm || isDelWord || isBlockedWord) {
+                    aliasDefinesShellOrDeletion = true
+                }
+            }
+            if (subArgs.any { isExternalHelperConfigKey(it.substringBefore("=")) }) {
+                hasExternalHelperConfig = true
+                for (a in subArgs) {
+                    val k = a.substringBefore("=").lowercase(Locale.ROOT).trim()
+                    if (isExternalHelperConfigKey(k) && k !in externalHelperConfigKeys) {
+                        externalHelperConfigKeys.add(k)
+                    }
+                }
+            }
+        }
+
+        val category = classifyGitSubcommand(subcmd, subArgs, hasVersionFlag, hasExternalHelperConfig)
+
+        return GitParsedInvocation(
+            subcommand = subcmd,
+            subcommandArgs = subArgs,
+            configs = configs,
+            definesAlias = definesAlias,
+            aliasDefinesShellOrDeletion = aliasDefinesShellOrDeletion,
+            hasOpaqueConfigEnvAlias = hasOpaqueConfigEnvAlias,
+            hasExternalHelperConfig = hasExternalHelperConfig,
+            externalHelperConfigKeys = externalHelperConfigKeys,
+            category = category,
+            isAmbiguousGlobalOptions = isAmbiguousGlobalOptions,
+        )
+    }
+
+    private fun classifyGitSubcommand(
+        subcmd: String?,
+        subArgs: List<String>,
+        hasVersionFlag: Boolean = false,
+        hasExternalHelperConfig: Boolean = false,
+    ): GitCategory {
+        if (hasExternalHelperConfig) {
+            return GitCategory.MUTATING
+        }
+        if (subcmd == null) {
+            return if (hasVersionFlag) GitCategory.READ_ONLY else GitCategory.UNKNOWN
+        }
+
+        if (subcmd in BASE_READ_ONLY_GIT_SUBCOMMANDS) {
+            if (subcmd == "diff" || subcmd == "show" || subcmd == "log") {
+                val hasExternalOrOutputFlag = subArgs.any { arg ->
+                    arg == "--ext-diff" ||
+                    arg.startsWith("--ext-diff=") ||
+                    arg == "--textconv" ||
+                    arg.startsWith("--textconv=") ||
+                    arg == "--output" ||
+                    arg.startsWith("--output=") ||
+                    arg == "-o" ||
+                    (arg.startsWith("-o") && arg.length > 2 && !arg.startsWith("--"))
+                }
+                if (hasExternalOrOutputFlag) {
+                    return GitCategory.MUTATING
+                }
+            }
+            return GitCategory.READ_ONLY
+        }
+
+        if (subcmd == "branch") {
+            val mutatingBranchFlags = setOf(
+                "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+                "--edit-description", "--set-upstream-to", "-u", "--unset-upstream"
+            )
+            if (subArgs.any { it in mutatingBranchFlags || mutatingBranchFlags.any { f -> it.startsWith("$f=") } }) {
+                return GitCategory.MUTATING
+            }
+
+            val listFlagsWithArg = setOf(
+                "--contains", "--no-contains", "--merged", "--no-merged", "--sort", "--format", "--points-at"
+            )
+            val listStandaloneFlags = setOf(
+                "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "-l", "--list",
+                "--show-current", "-i", "--ignore-case", "-q", "--quiet", "--no-color", "--color",
+                "--column", "--no-column"
+            )
+            val hasListFlag = subArgs.any { it == "-l" || it == "--list" }
+
+            var i = 0
+            while (i < subArgs.size) {
+                val a = subArgs[i]
+                if (a in listStandaloneFlags) {
+                    i++
+                    continue
+                }
+                if (a in listFlagsWithArg) {
+                    i += 2
+                    continue
+                }
+                if (listFlagsWithArg.any { f -> a.startsWith("$f=") }) {
+                    i++
+                    continue
+                }
+                if (!a.startsWith("-")) {
+                    // If listing flag is present, positional arg is a pattern; otherwise it is a branch to create/modify
+                    if (hasListFlag) {
+                        i++
+                        continue
+                    }
+                    return GitCategory.MUTATING
+                }
+                return GitCategory.MUTATING
+            }
+            return GitCategory.READ_ONLY
+        }
+
+        if (subcmd == "tag") {
+            val mutatingTagFlags = setOf(
+                "-d", "--delete", "-a", "-s", "-u", "-f", "--force", "-m", "-F"
+            )
+            if (subArgs.any { it in mutatingTagFlags || mutatingTagFlags.any { f -> it.startsWith("$f=") } }) {
+                return GitCategory.MUTATING
+            }
+
+            val listTagFlagsWithArg = setOf(
+                "-n", "--sort", "--contains", "--no-contains", "--points-at", "--format"
+            )
+            val listTagStandaloneFlags = setOf(
+                "-l", "--list", "-v", "--verify", "-i", "--ignore-case", "--column", "--no-column"
+            )
+            val hasListFlag = subArgs.any { it == "-l" || it == "--list" }
+            val hasVerifyFlag = subArgs.any { it == "-v" || it == "--verify" }
+
+            var i = 0
+            while (i < subArgs.size) {
+                val a = subArgs[i]
+                if (a in listTagStandaloneFlags) {
+                    i++
+                    continue
+                }
+                if (a in listTagFlagsWithArg) {
+                    i += 2
+                    continue
+                }
+                if (listTagFlagsWithArg.any { f -> a.startsWith("$f=") } || a.startsWith("-n")) {
+                    i++
+                    continue
+                }
+                if (!a.startsWith("-")) {
+                    if (hasListFlag || hasVerifyFlag) {
+                        i++
+                        continue
+                    }
+                    // Positional argument without list/verify: creating a tag!
+                    return GitCategory.MUTATING
+                }
+                return GitCategory.MUTATING
+            }
+            return GitCategory.READ_ONLY
+        }
+
+        if (subcmd == "remote") {
+            val mutatingRemoteSubs = setOf(
+                "add", "rename", "remove", "rm", "set-head", "set-branches", "set-url", "prune", "update"
+            )
+            val readOnlyRemoteSubs = setOf(
+                "get-url"
+            )
+            val nonFlagArgs = subArgs.filter { !it.startsWith("-") }
+            if (nonFlagArgs.isEmpty()) {
+                return GitCategory.READ_ONLY
+            }
+            val remoteSub = nonFlagArgs[0].lowercase(Locale.ROOT)
+            if (remoteSub in mutatingRemoteSubs) {
+                return GitCategory.MUTATING
+            }
+            if (remoteSub in readOnlyRemoteSubs) {
+                return GitCategory.READ_ONLY
+            }
+            if (remoteSub == "show") {
+                val hasNoQueryFlag = subArgs.any { it == "-n" }
+                if (hasNoQueryFlag) {
+                    return GitCategory.READ_ONLY
+                }
+                return GitCategory.MUTATING
+            }
+            return GitCategory.MUTATING
+        }
+
+        if (subcmd in MUTATING_GIT_SUBCOMMANDS) {
+            return GitCategory.MUTATING
+        }
+
+        return GitCategory.UNKNOWN
+    }
+
+    private fun parseXargsArgs(args: List<String>): XargsParseResult {
+        if (args.isEmpty()) {
+            return XargsParseResult(target = null, targetArgs = emptyList(), isAmbiguous = true)
+        }
+
+        val longOptsWithArg = setOf(
+            "--max-args", "--max-procs", "--arg-file", "--delimiter", "--eof", "--max-lines", "--max-chars"
+        )
+        val standaloneLongOpts = setOf(
+            "--null", "--interactive", "--no-run-if-empty", "--verbose", "--open-tty", "--exact", "--exit"
+        )
+        val standaloneShortOpts = setOf('0', 'p', 'r', 't', 'o', 'x')
+        val shortOptsWithArg = setOf('d', 'E', 'e', 'I', 'i', 'L', 'l', 'n', 'P', 's', 'a')
+
+        var i = 0
+        var isAmbiguous = false
+
+        while (i < args.size) {
+            val arg = args[i]
+
+            // End of options marker
+            if (arg == "--") {
+                i++
+                break
+            }
+
+            // Long options
+            if (arg.startsWith("--")) {
+                if (arg.startsWith("--replace=")) {
+                    val replacement = arg.substringAfter("=")
+                    if (replacement.isEmpty() || replacement == "\"\"" || replacement == "''") {
+                        isAmbiguous = true
+                        break
+                    }
+                    i++
+                    continue
+                }
+                if (arg == "--replace") {
+                    if (i + 1 < args.size) {
+                        val replacement = args[i + 1]
+                        if (replacement.isEmpty() || replacement.startsWith("-")) {
+                            isAmbiguous = true
+                            break
+                        }
+                        i += 2
+                        continue
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                if (arg.contains("=")) {
+                    val optName = arg.substringBefore("=")
+                    if (optName in longOptsWithArg) {
+                        i++
+                        continue
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                if (arg in standaloneLongOpts) {
+                    i++
+                    continue
+                }
+                if (arg in longOptsWithArg) {
+                    if (i + 1 < args.size) {
+                        i += 2
+                        continue
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                isAmbiguous = true
+                break
+            }
+
+            // Short options
+            if (arg.startsWith("-") && arg.length > 1) {
+                var c = 1
+                while (c < arg.length) {
+                    val ch = arg[c]
+                    if (ch in standaloneShortOpts) {
+                        c++
+                    } else if (ch in shortOptsWithArg) {
+                        val rest = arg.substring(c + 1)
+                        if (rest.isNotEmpty()) {
+                            // Value is embedded in same argument: e.g. -I{}, -P4, -n1
+                            c = arg.length
+                        } else {
+                            if (ch == 'i' || ch == 'e') {
+                                // -i and -e can be standalone in POSIX/GNU xargs
+                                c = arg.length
+                            } else {
+                                if (i + 1 < args.size) {
+                                    i++
+                                    c = arg.length
+                                } else {
+                                    isAmbiguous = true
+                                    break
+                                }
+                            }
+                        }
+                    } else {
+                        isAmbiguous = true
+                        break
+                    }
+                }
+                if (isAmbiguous) break
+                i++
+                continue
+            }
+
+            // First non-option token is the target command
+            break
+        }
+
+        if (isAmbiguous) {
+            return XargsParseResult(target = null, targetArgs = emptyList(), isAmbiguous = true)
+        }
+
+        if (i < args.size) {
+            val target = args[i]
+            val targetArgs = if (i + 1 < args.size) args.subList(i + 1, args.size) else emptyList()
+            return XargsParseResult(target = target, targetArgs = targetArgs, isAmbiguous = false)
+        }
+
+        // xargs without command defaults to echo, but cannot be verified safe
+        return XargsParseResult(target = null, targetArgs = emptyList(), isAmbiguous = true)
+    }
+
+    private fun unwrapCommand(rawCommand: String, normalizedName: String, args: List<String>): ParsedCommandChain {
+        var curCommand = rawCommand
+        var curNormalized = normalizedName
+        var curArgs = args
+        val wrappers = mutableListOf<String>()
+        var isAmbiguousWrapper = false
+
+        while (curNormalized in WRAPPER_COMMANDS) {
+            wrappers.add(curNormalized)
+            if (curNormalized == "xargs") {
+                val parsedXargs = parseXargsArgs(curArgs)
+                if (parsedXargs.isAmbiguous || parsedXargs.target == null) {
+                    isAmbiguousWrapper = true
+                    break
+                }
+                curCommand = parsedXargs.target
+                curArgs = parsedXargs.targetArgs
+                val isWin = System.getProperty("os.name")?.lowercase(Locale.ROOT)?.contains("win") == true
+                val name = Path.of(curCommand.replace('\\', '/')).fileName?.toString() ?: curCommand
+                curNormalized = if (isWin) {
+                    name.lowercase(Locale.ROOT).removeSuffix(".exe").removeSuffix(".cmd").removeSuffix(".bat")
+                } else {
+                    name.lowercase(Locale.ROOT)
+                }
+                continue
+            }
+
+            val next = findWrappedTarget(curNormalized, curArgs)
+            if (next == null) {
+                isAmbiguousWrapper = true
+                break
+            }
+            curCommand = next.first
+            curArgs = next.second
+            val isWin = System.getProperty("os.name")?.lowercase(Locale.ROOT)?.contains("win") == true
+            val name = Path.of(curCommand.replace('\\', '/')).fileName?.toString() ?: curCommand
+            curNormalized = if (isWin) {
+                name.lowercase(Locale.ROOT).removeSuffix(".exe").removeSuffix(".cmd").removeSuffix(".bat")
+            } else {
+                name.lowercase(Locale.ROOT)
+            }
+        }
+
+        return ParsedCommandChain(
+            effectiveCommand = curCommand,
+            effectiveNormalized = curNormalized,
+            effectiveArgs = curArgs,
+            isWrapped = wrappers.isNotEmpty(),
+            wrappers = wrappers,
+            isAmbiguousWrapper = isAmbiguousWrapper,
+        )
+    }
+
+    private fun findWrappedTarget(wrapper: String, args: List<String>): Pair<String, List<String>>? {
+        if (args.isEmpty()) return null
+        var i = 0
+
+        when (wrapper) {
+            "xargs" -> {
+                val parsed = parseXargsArgs(args)
+                if (parsed.isAmbiguous || parsed.target == null) {
+                    return null
+                }
+                return Pair(parsed.target, parsed.targetArgs)
+            }
+            "sudo", "doas", "pkexec" -> {
+                val optsWithArg = setOf("-u", "-g", "-p", "-c", "-C", "-r", "-t", "--user")
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a == "--") {
+                        i++
+                        break
+                    }
+                    if (a in optsWithArg) {
+                        i += 2
+                        continue
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "env" -> {
+                val optsWithArg = setOf("-u", "-C")
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a == "--") {
+                        i++
+                        break
+                    }
+                    if (a in optsWithArg) {
+                        i += 2
+                        continue
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    // Skip VAR=val environment assignments
+                    if (a.contains("=") && !a.startsWith("=")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "busybox" -> {
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "nohup" -> {
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a == "--") {
+                        i++
+                        break
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    break
+                }
+            }
+            "su" -> {
+                val optsWithArg = setOf("-c", "-s")
+                while (i < args.size) {
+                    val a = args[i]
+                    if (a in optsWithArg) {
+                        if (a == "-c" && i + 1 < args.size) {
+                            val cmdString = args[i + 1]
+                            val parts = cmdString.trim().split(Regex("\\s+"))
+                            if (parts.isNotEmpty()) {
+                                return Pair(parts[0], parts.drop(1))
+                            }
+                        }
+                        i += 2
+                        continue
+                    }
+                    if (a.startsWith("-")) {
+                        i++
+                        continue
+                    }
+                    // username
+                    i++
+                    break
+                }
+            }
+            else -> {
+                while (i < args.size && args[i].startsWith("-")) {
+                    i++
+                }
+            }
+        }
+
+        if (i < args.size) {
+            val target = args[i]
+            val targetArgs = if (i + 1 < args.size) args.subList(i + 1, args.size) else emptyList()
+            return Pair(target, targetArgs)
+        }
+        return null
+    }
+
+    private fun isTerminalDeletionCommand(
+        normalizedName: String,
+        cmd: TerminalCommand,
+        shellTokens: Set<String> = emptySet(),
+        parsedGit: GitParsedInvocation? = null,
+    ): Boolean {
+        if (normalizedName in FILE_DELETION_COMMANDS) return true
+        if (normalizedName == "git") {
+            val git = parsedGit ?: parseGitArgs(cmd.args)
+            if (git.subcommand == "clean") return true
+            if (git.subcommand == "rm") {
+                val hasCached = git.subcommandArgs.any { it == "--cached" }
+                if (!hasCached) return true
+            }
+            if (git.aliasDefinesShellOrDeletion) return true
+            if (git.hasOpaqueConfigEnvAlias) return true
+            for (cfg in git.configs) {
+                val valPart = cfg.substringAfter("=", "").lowercase(Locale.ROOT)
+                val targetFirstWord = valPart.removePrefix("!").trim().split(Regex("\\s+")).firstOrNull() ?: ""
+                val isGitClean = targetFirstWord == "clean"
+                val isGitRm = targetFirstWord == "rm" && !valPart.contains("--cached")
+                val isDelWord = FILE_DELETION_COMMANDS.any { del -> valPart.contains("\\b$del\\b".toRegex()) || valPart.contains(del) }
+                if (isGitClean || isGitRm || isDelWord) {
+                    return true
+                }
+            }
+        }
+        if (normalizedName in SHELL_LAUNCHERS) {
+            if (FILE_DELETION_COMMANDS.any { it in shellTokens }) {
+                return true
+            }
+            val fullArgs = cmd.args.joinToString(" ").lowercase(Locale.ROOT)
+            if (FILE_DELETION_COMMANDS.any { del -> fullArgs.contains("\\b$del\\b".toRegex()) || fullArgs.contains(del) }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isDestructiveGitCommand(
+        normalizedName: String,
+        cmd: TerminalCommand,
+        parsedGit: GitParsedInvocation = parseGitArgs(cmd.args),
+    ): Boolean {
+        if (normalizedName != "git") return false
+        val subcmd = parsedGit.subcommand ?: return false
+        if (subcmd in DESTRUCTIVE_GIT_SUBCOMMANDS) return true
+        if (subcmd == "rm") {
+            val hasCached = parsedGit.subcommandArgs.any { it == "--cached" }
+            if (!hasCached) return true
+        }
+        if (subcmd == "checkout") {
+            if (parsedGit.subcommandArgs.any { it == "-f" || it == "--force" || it == "-B" || it == "--discard-changes" }) return true
+        }
+        if (subcmd == "switch") {
+            if (parsedGit.subcommandArgs.any { it == "-f" || it == "--force" || it == "-C" || it == "--discard-changes" }) return true
+        }
+        if (subcmd == "branch") {
+            val hasDelete = parsedGit.subcommandArgs.any { it == "-D" || it == "-d" || it == "--delete" }
+            val hasForce = parsedGit.subcommandArgs.any { it == "-D" || it == "-f" || it == "--force" }
+            if (parsedGit.subcommandArgs.any { it == "-D" } || (hasDelete && hasForce)) return true
+        }
+        return false
+    }
+
+    private fun isDangerousCommand(
+        cmdName: String,
+        normalizedName: String,
+        cmd: TerminalCommand,
+        isDestructiveGit: Boolean,
+        isDeletion: Boolean,
+        isWrapped: Boolean,
+        parsedGit: GitParsedInvocation?,
+    ): Boolean {
+        if (isWrapped) return true
+        if (cmdName in TerminalConfig.DEFAULT_DANGEROUS_COMMANDS || normalizedName in TerminalConfig.DEFAULT_DANGEROUS_COMMANDS) {
+            return true
+        }
+        if (normalizedName in SHELL_LAUNCHERS) {
+            return true
+        }
+        if (isDestructiveGit) {
+            return true
+        }
+        if (isDeletion) {
+            return true
+        }
+        if (normalizedName == "git" && parsedGit != null) {
+            if (parsedGit.definesAlias) return true
+            if (parsedGit.hasOpaqueConfigEnvAlias) return true
+            if (parsedGit.hasExternalHelperConfig) return true
+            if (parsedGit.category == GitCategory.MUTATING || parsedGit.category == GitCategory.UNKNOWN) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun extractPathArg(call: ToolCall): String? {
+        return try {
+            val args = ToolArgsParser.parseObject(call.arguments)
+            args["path"] ?: args["filename"] ?: args["file"] ?: args["dir"] ?: args["directory"]
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun validatePathBoundary(
+        pathStr: String,
+        workspaceRoot: Path,
+        mustExist: Boolean,
+    ): SecurityDecision? {
+        if (pathStr.contains('\u0000')) {
+            return SecurityDecision(SecurityDecisionKind.DENIED, "Null byte detected in path string")
+        }
+        val resolver = WorkspacePathResolver(workspaceRoot)
+        return try {
+            resolver.resolve(pathStr, mustExist = mustExist)
+            null
+        } catch (e: SecurityException) {
+            SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Path boundary violation: ${e.message}",
+            )
+        } catch (e: Exception) {
+            SecurityDecision(
+                kind = SecurityDecisionKind.DENIED,
+                reason = "Invalid path '$pathStr': ${e.message}",
+            )
+        }
     }
 }
 ```
 
 ---
 
-### Файл 2: `tools/webview2-host/Protocol/HostCommand.cs`
-```csharp
-using System.Text.Json.Serialization;
-
-namespace Antigooglity.WebView2Host.Protocol;
-
-public class HostCommand
-{
-    [JsonPropertyName("requestId")]
-    public string RequestId { get; set; } = string.Empty;
-
-    [JsonPropertyName("command")]
-    public string Command { get; set; } = string.Empty;
-
-    [JsonPropertyName("url")]
-    public string? Url { get; set; }
-
-    [JsonPropertyName("script")]
-    public string? Script { get; set; }
-
-    [JsonPropertyName("timeoutMs")]
-    public int? TimeoutMs { get; set; }
-
-    [JsonPropertyName("visible")]
-    public bool? Visible { get; set; }
-
-    [JsonPropertyName("maxLength")]
-    public int? MaxLength { get; set; }
-}
-```
+### Паспорт файла:
+- **Относительный путь:** `shared/src2/jvmMain/kotlin/com/limer/antigooglity/coordinator/SecurityPolicy.kt`
+- **Статус:** `MODIFIED`
+- **Фактическое количество строк:** `1843`
+- **Размер в байтах:** `78502`
+- **SHA-256:** `22f0a6631dc95831f785111e87073ce5c8eb8691ab4fc1aa9686947f47d6ef28`
+- **Подтверждение соответствия:** Текст точно соответствует версии файла на диске, на которой успешно выполнены `jvmTest` и `allTests`.
 
 ---
 
-### Файл 3: `tools/webview2-host/BrowserHostForm.cs`
-```csharp
-using System.Drawing;
-using System.Windows.Forms;
-
-namespace Antigooglity.WebView2Host;
-
-public class BrowserHostForm : Form
-{
-    private bool _allowVisible;
-
-    public bool IsDiagnosticVisible => _allowVisible;
-
-    public bool IsVisibleBrowserMode { get; set; }
-
-    public event Action<bool>? VisibilityChanged;
-
-    public BrowserHostForm()
-    {
-        Text = "Antigooglity - WebView2 Diagnostic Window";
-        StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(1280, 800);
-        MinimumSize = new Size(600, 400);
-        FormBorderStyle = FormBorderStyle.Sizable;
-        ShowInTaskbar = true;
-        WindowState = FormWindowState.Normal;
-        Opacity = 1.0;
-
-        // Force native HWND handle creation so WebView2 can attach
-        CreateHandle();
-    }
-
-    public void SetDiagnosticVisibility(bool visible)
-    {
-        _allowVisible = visible;
-        if (visible)
-        {
-            Show();
-            BringToFront();
-            Activate();
-        }
-        else
-        {
-            Hide();
-        }
-
-        VisibilityChanged?.Invoke(visible);
-    }
-
-    protected override void SetVisibleCore(bool value)
-    {
-        base.SetVisibleCore(_allowVisible && value);
-    }
-
-    protected override void OnFormClosing(FormClosingEventArgs e)
-    {
-        if (IsVisibleBrowserMode)
-        {
-            // In visible browser mode, user closing the form exits the application cleanly
-            base.OnFormClosing(e);
-            return;
-        }
-
-        if (e.CloseReason == CloseReason.UserClosing)
-        {
-            // If user closes diagnostic window in hidden mode, switch back to hidden mode instead of killing the process
-            e.Cancel = true;
-            SetDiagnosticVisibility(false);
-        }
-        else
-        {
-            base.OnFormClosing(e);
-        }
-    }
-}
-```
-
----
-
-### Файл 4: `tools/webview2-host/Program.cs`
-```csharp
-using System.Text;
-using System.Threading.Channels;
-using System.Windows.Forms;
-using Antigooglity.WebView2Host.Protocol;
-
-namespace Antigooglity.WebView2Host;
-
-internal static class Program
-{
-    [STAThread]
-    private static void Main(string[] args)
-    {
-        try
-        {
-            Console.InputEncoding = Encoding.UTF8;
-            Console.OutputEncoding = new UTF8Encoding(false);
-        }
-        catch
-        {
-            // Ignore when standard handles are redirected without Win32 console buffer
-        }
-
-        JsonLineProtocol.LogDiagnostic("Antigooglity WebView2 Host starting...");
-
-        // Parse optional custom user data folder from arguments or environment
-        string? customProfile = null;
-        for (var i = 0; i < args.Length; i++)
-        {
-            if ((args[i] == "--user-data-dir" || args[i] == "-profile") && i + 1 < args.Length)
-            {
-                customProfile = args[i + 1];
-                i++;
-            }
-            else if (args[i].StartsWith("--user-data-dir="))
-            {
-                customProfile = args[i].Substring("--user-data-dir=".Length);
-            }
-        }
-
-        if (string.IsNullOrWhiteSpace(customProfile))
-        {
-            customProfile = Environment.GetEnvironmentVariable("ANTIGOOGLITY_WEBVIEW2_PROFILE");
-        }
-
-        var isVisibleBrowserMode = args.Any(a => a == "--visible-browser" || a == "--open-browser" || a == "--interactive-login");
-
-        // Requirement 9: Prevent concurrent access to the same WebView2 profile
-        const string MutexName = @"Local\Antigooglity_WebView2_Profile_Instance_Mutex";
-        using var singleInstanceMutex = new Mutex(true, MutexName, out bool isOnlyInstance);
-        if (!isOnlyInstance)
-        {
-            Console.Error.WriteLine("ERROR: Another instance of Antigooglity WebView2 Host is already running.");
-            Console.Error.WriteLine("Please close Antigooglity before opening the interactive browser to switch accounts.");
-            Environment.Exit(1);
-            return;
-        }
-
-        ApplicationConfiguration.Initialize();
-
-        using var form = new BrowserHostForm();
-        using var controller = new BrowserController(customProfile);
-        controller.AttachForm(form);
-
-        var appCtx = new ApplicationContext();
-        var isExiting = 0;
-
-        void SafeExit()
-        {
-            if (Interlocked.Exchange(ref isExiting, 1) == 0)
-            {
-                JsonLineProtocol.LogDiagnostic("Shutting down WebView2 Host application loop...");
-                try
-                {
-                    if (form.IsHandleCreated && !form.IsDisposed)
-                    {
-                        form.BeginInvoke(new Action(() =>
-                        {
-                            controller.Dispose();
-                            appCtx.ExitThread();
-                        }));
-                    }
-                    else
-                    {
-                        controller.Dispose();
-                        appCtx.ExitThread();
-                    }
-                }
-                catch
-                {
-                    Environment.Exit(0);
-                }
-            }
-        }
-
-        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
-        {
-            controller.Dispose();
-        };
-
-        var syncContext = SynchronizationContext.Current;
-        if (syncContext == null)
-        {
-            syncContext = new WindowsFormsSynchronizationContext();
-            SynchronizationContext.SetSynchronizationContext(syncContext);
-        }
-
-        if (isVisibleBrowserMode)
-        {
-            form.IsVisibleBrowserMode = true;
-            form.Text = "Antigooglity - Google Account Login (Gemini)";
-            form.FormClosed += (_, _) =>
-            {
-                SafeExit();
-            };
-
-            syncContext.Post(async _ =>
-            {
-                try
-                {
-                    await controller.InitializeAsync(form.Handle, isVisibleBrowser: true);
-                    form.SetDiagnosticVisibility(true);
-                    controller.Navigate("https://gemini.google.com");
-                    JsonLineProtocol.LogDiagnostic("Visible browser opened for Gemini login. Close window to finish.");
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"FATAL: Failed to open visible browser: {ex.Message}");
-                    SafeExit();
-                }
-            }, null);
-
-            Application.Run(appCtx);
-            JsonLineProtocol.LogDiagnostic("Antigooglity WebView2 Host exited cleanly.");
-            return;
-        }
-
-        // Sequential command queue channel for thread-safe STA execution
-        var commandChannel = Channel.CreateUnbounded<HostCommand>(new UnboundedChannelOptions
-        {
-            SingleWriter = true,
-            SingleReader = true
-        });
-
-        // Post initialization and command processor onto the STA message loop
-        syncContext.Post(async _ =>
-        {
-            try
-            {
-                await controller.InitializeAsync(form.Handle);
-                JsonLineProtocol.LogDiagnostic("WebView2 Host ready to accept commands.");
-
-                // Start background reader for JSON Lines protocol on stdin
-                var readerThread = new Thread(() => RunStdinReader(commandChannel, SafeExit))
-                {
-                    IsBackground = true,
-                    Name = "StdinProtocolReader"
-                };
-                readerThread.Start();
-
-                // Sequential command consumer running strictly on the STA thread
-                await ProcessCommandsSequentiallyAsync(commandChannel.Reader, controller, SafeExit);
-            }
-            catch (Exception ex)
-            {
-                JsonLineProtocol.LogDiagnostic($"FATAL: WebView2 initialization or processing failed: {ex}");
-                JsonLineProtocol.SendResponse(HostResponse.CreateError("init", "INITIALIZATION", ex.Message));
-                SafeExit();
-            }
-        }, null);
-
-        // Run STA Message Loop
-        Application.Run(appCtx);
-
-        JsonLineProtocol.LogDiagnostic("Antigooglity WebView2 Host exited cleanly.");
-    }
-
-    private static void RunStdinReader(Channel<HostCommand> commandChannel, Action exitAction)
-    {
-        using var stdinReader = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8);
-
-        try
-        {
-            while (true)
-            {
-                var line = stdinReader.ReadLine();
-                if (line == null)
-                {
-                    // EOF detected (parent process closed stdin or terminated)
-                    JsonLineProtocol.LogDiagnostic("EOF on stdin detected. Completing command channel...");
-                    commandChannel.Writer.TryComplete();
-                    exitAction();
-                    break;
-                }
-
-                var command = JsonLineProtocol.ParseCommand(line, out var parseError);
-                if (command == null)
-                {
-                    if (!string.IsNullOrEmpty(parseError))
-                    {
-                        JsonLineProtocol.SendResponse(HostResponse.CreateError("unknown", "SYNTAX_ERROR", parseError));
-                    }
-                    continue;
-                }
-
-                // Enqueue command for sequential execution on the STA thread
-                commandChannel.Writer.TryWrite(command);
-            }
-        }
-        catch (Exception ex)
-        {
-            JsonLineProtocol.LogDiagnostic($"Reader exception: {ex.Message}");
-            commandChannel.Writer.TryComplete(ex);
-            exitAction();
-        }
-    }
-
-    private static async Task ProcessCommandsSequentiallyAsync(
-        ChannelReader<HostCommand> reader,
-        BrowserController controller,
-        Action exitAction)
-    {
-        try
-        {
-            while (await reader.WaitToReadAsync())
-            {
-                while (reader.TryRead(out var cmd))
-                {
-                    try
-                    {
-                        await ProcessCommandOnStaThreadAsync(cmd, controller, exitAction);
-                    }
-                    catch (Exception ex)
-                    {
-                        JsonLineProtocol.LogDiagnostic($"Unhandled exception processing '{cmd.Command}': {ex}");
-                        JsonLineProtocol.SendResponse(HostResponse.CreateError(cmd.RequestId, cmd.Command, ex.Message));
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            JsonLineProtocol.LogDiagnostic($"Command sequential loop terminated: {ex.Message}");
-        }
-    }
-
-    private static async Task ProcessCommandOnStaThreadAsync(
-        HostCommand cmd,
-        BrowserController controller,
-        Action exitAction)
-    {
-        switch (cmd.Command.ToUpperInvariant())
-        {
-            case "PING":
-            {
-                var response = controller.HandlePing(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "GET_STATUS":
-            {
-                var response = controller.HandleGetStatus(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "GET_CURRENT_URL":
-            {
-                var response = controller.HandleGetCurrentUrl(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "GET_NAVIGATION_STATUS":
-            {
-                var response = controller.HandleGetNavigationStatus(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "SET_VISIBILITY":
-            {
-                var response = controller.HandleSetVisibility(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "GET_DOCUMENT_INFO":
-            {
-                var response = await controller.HandleGetDocumentInfoAsync(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "GET_PAGE_TEXT":
-            {
-                var response = await controller.HandleGetPageTextAsync(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "NAVIGATE":
-            {
-                var response = await controller.HandleNavigateAsync(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "EXECUTE_SCRIPT":
-            {
-                var response = await controller.HandleExecuteScriptAsync(cmd);
-                JsonLineProtocol.SendResponse(response);
-                break;
-            }
-
-            case "CLOSE":
-            {
-                var response = controller.HandleClose(cmd);
-                JsonLineProtocol.SendResponse(response);
-                exitAction();
-                break;
-            }
-
-            default:
-            {
-                JsonLineProtocol.SendResponse(HostResponse.CreateError(
-                    cmd.RequestId,
-                    cmd.Command,
-                    $"Unknown command: '{cmd.Command}'"
-                ));
-                break;
-            }
-        }
-    }
-}
-```
-
----
-
-### Файл 5: `tools/webview2-host/BrowserController.cs`
-```csharp
-using System.Drawing;
-using System.Text.Json;
-using Antigooglity.WebView2Host.Protocol;
-using Microsoft.Web.WebView2.Core;
-
-namespace Antigooglity.WebView2Host;
-
-public class BrowserController : IDisposable
-{
-    private CoreWebView2Environment? _environment;
-    private CoreWebView2Controller? _controller;
-    private CoreWebView2? _coreWebView2;
-    private BrowserHostForm? _form;
-    private bool _isNavigating;
-
-    public bool IsInitialized => _coreWebView2 != null;
-    public string? RuntimeVersion { get; private set; }
-    public string UserDataFolder { get; }
-
-    public BrowserController(string? customUserDataFolder = null)
-    {
-        if (!string.IsNullOrWhiteSpace(customUserDataFolder))
-        {
-            UserDataFolder = Path.GetFullPath(customUserDataFolder);
-        }
-        else
-        {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            UserDataFolder = Path.Combine(localAppData, "Antigooglity", "webview2-profile");
-        }
-        Directory.CreateDirectory(UserDataFolder);
-    }
-
-    public void AttachForm(BrowserHostForm form)
-    {
-        _form = form;
-        _form.Resize += (_, _) =>
-        {
-            if (_controller != null && _controller.IsVisible && _form.ClientRectangle.Width > 0 && _form.ClientRectangle.Height > 0)
-            {
-                _controller.Bounds = _form.ClientRectangle;
-            }
-        };
-
-        _form.VisibilityChanged += visible =>
-        {
-            if (_controller != null)
-            {
-                _controller.IsVisible = visible;
-                if (visible && _form.ClientRectangle.Width > 0 && _form.ClientRectangle.Height > 0)
-                {
-                    _controller.Bounds = _form.ClientRectangle;
-                }
-                else
-                {
-                    _controller.Bounds = new Rectangle(0, 0, 1280, 800);
-                }
-            }
-        };
-    }
-
-    public async Task InitializeAsync(IntPtr hwnd, bool isVisibleBrowser = false)
-    {
-        try
-        {
-            RuntimeVersion = CoreWebView2Environment.GetAvailableBrowserVersionString();
-            JsonLineProtocol.LogDiagnostic($"WebView2 Runtime detected: {RuntimeVersion}");
-        }
-        catch (Exception ex)
-        {
-            JsonLineProtocol.LogDiagnostic($"Failed to detect WebView2 Runtime via GetAvailableBrowserVersionString: {ex.Message}");
-            throw;
-        }
-
-        JsonLineProtocol.LogDiagnostic($"Initializing CoreWebView2Environment with profile: {UserDataFolder}");
-        _environment = await CoreWebView2Environment.CreateAsync(browserExecutableFolder: null, userDataFolder: UserDataFolder);
-
-        JsonLineProtocol.LogDiagnostic($"Creating CoreWebView2Controller on HWND 0x{hwnd:X}...");
-        _controller = await _environment.CreateCoreWebView2ControllerAsync(hwnd);
-
-        if (isVisibleBrowser)
-        {
-            _controller.Bounds = _form?.ClientRectangle ?? new Rectangle(0, 0, 1280, 800);
-            _controller.IsVisible = true;
-            _controller.DefaultBackgroundColor = Color.White;
-        }
-        else
-        {
-            // Explicit requirement: Hidden mode by default
-            _controller.Bounds = new Rectangle(0, 0, 1280, 800);
-            _controller.IsVisible = false;
-            _controller.DefaultBackgroundColor = Color.Transparent;
-        }
-
-        _coreWebView2 = _controller.CoreWebView2;
-
-        _coreWebView2.NavigationStarting += (_, _) => _isNavigating = true;
-        _coreWebView2.NavigationCompleted += (_, _) => _isNavigating = false;
-
-        // Security and stability settings
-        _coreWebView2.Settings.IsStatusBarEnabled = isVisibleBrowser;
-        _coreWebView2.Settings.AreDevToolsEnabled = isVisibleBrowser;
-        _coreWebView2.Settings.IsBuiltInErrorPageEnabled = true;
-        _coreWebView2.Settings.AreDefaultScriptDialogsEnabled = true;
-
-        JsonLineProtocol.LogDiagnostic($"WebView2 initialized successfully. IsVisible: {_controller.IsVisible}");
-    }
-
-    public void Navigate(string url)
-    {
-        if (_coreWebView2 != null && !string.IsNullOrWhiteSpace(url))
-        {
-            _coreWebView2.Navigate(url);
-        }
-    }
-
-    public HostResponse HandlePing(HostCommand cmd)
-    {
-        return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-        {
-            message = "PONG",
-            timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            runtimeVersion = RuntimeVersion
-        });
-    }
-
-    public HostResponse HandleGetStatus(HostCommand cmd)
-    {
-        return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-        {
-            initialized = IsInitialized,
-            runtimeVersion = RuntimeVersion,
-            userDataFolder = UserDataFolder,
-            isVisible = _controller?.IsVisible ?? false,
-            formVisible = _form?.IsDiagnosticVisible ?? false,
-            currentUrl = _coreWebView2?.Source ?? string.Empty
-        });
-    }
-
-    public HostResponse HandleGetCurrentUrl(HostCommand cmd)
-    {
-        if (!IsInitialized || _coreWebView2 == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-        {
-            url = _coreWebView2.Source
-        });
-    }
-
-    public HostResponse HandleGetNavigationStatus(HostCommand cmd)
-    {
-        if (!IsInitialized || _coreWebView2 == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-        {
-            currentUrl = _coreWebView2.Source,
-            isNavigating = _isNavigating,
-            canGoBack = _coreWebView2.CanGoBack,
-            canGoForward = _coreWebView2.CanGoForward,
-            documentTitle = _coreWebView2.DocumentTitle
-        });
-    }
-
-    public HostResponse HandleSetVisibility(HostCommand cmd)
-    {
-        if (!IsInitialized || _controller == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        if (!cmd.Visible.HasValue)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "The 'visible' parameter (boolean) is required for SET_VISIBILITY");
-        }
-
-        var visible = cmd.Visible.Value;
-        JsonLineProtocol.LogDiagnostic($"SET_VISIBILITY requested: {visible}");
-
-        if (_form != null)
-        {
-            _form.SetDiagnosticVisibility(visible);
-        }
-
-        _controller.IsVisible = visible;
-        if (visible && _form != null && _form.ClientRectangle.Width > 0 && _form.ClientRectangle.Height > 0)
-        {
-            _controller.Bounds = _form.ClientRectangle;
-        }
-        else
-        {
-            _controller.Bounds = new Rectangle(0, 0, 1280, 800);
-        }
-
-        return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-        {
-            isVisible = _controller.IsVisible,
-            formVisible = _form?.IsDiagnosticVisible ?? false
-        });
-    }
-
-    public async Task<HostResponse> HandleNavigateAsync(HostCommand cmd)
-    {
-        if (!IsInitialized || _coreWebView2 == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        if (string.IsNullOrWhiteSpace(cmd.Url))
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "URL parameter is required for NAVIGATE");
-        }
-
-        var tcs = new TaskCompletionSource<NavigationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var timeoutMs = cmd.TimeoutMs ?? 30000;
-
-        void NavigationCompletedHandler(object? sender, CoreWebView2NavigationCompletedEventArgs e)
-        {
-            tcs.TrySetResult(new NavigationResult(e.IsSuccess, e.WebErrorStatus.ToString(), e.HttpStatusCode));
-        }
-
-        _coreWebView2.NavigationCompleted += NavigationCompletedHandler;
-
-        try
-        {
-            JsonLineProtocol.LogDiagnostic($"Navigating to '{cmd.Url}' (timeout: {timeoutMs}ms)...");
-            _coreWebView2.Navigate(cmd.Url);
-
-            using var cts = new CancellationTokenSource(timeoutMs);
-            using (cts.Token.Register(() => tcs.TrySetCanceled()))
-            {
-                var result = await tcs.Task;
-                JsonLineProtocol.LogDiagnostic($"Navigation completed. Success: {result.IsSuccess}, Status: {result.ErrorStatus}, HTTP: {result.HttpStatusCode}");
-
-                return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-                {
-                    url = _coreWebView2.Source,
-                    isSuccess = result.IsSuccess,
-                    errorStatus = result.ErrorStatus,
-                    httpStatusCode = result.HttpStatusCode
-                });
-            }
-        }
-        catch (TaskCanceledException)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"Navigation timed out after {timeoutMs}ms");
-        }
-        catch (Exception ex)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"Navigation failed: {ex.Message}");
-        }
-        finally
-        {
-            _coreWebView2.NavigationCompleted -= NavigationCompletedHandler;
-        }
-    }
-
-    public async Task<HostResponse> HandleExecuteScriptAsync(HostCommand cmd)
-    {
-        if (!IsInitialized || _coreWebView2 == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        if (string.IsNullOrWhiteSpace(cmd.Script))
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "Script parameter is required for EXECUTE_SCRIPT");
-        }
-
-        var timeoutMs = cmd.TimeoutMs ?? 15000;
-
-        try
-        {
-            using var cts = new CancellationTokenSource(timeoutMs);
-            var executeTask = _coreWebView2.ExecuteScriptAsync(cmd.Script);
-
-            var completedTask = await Task.WhenAny(executeTask, Task.Delay(timeoutMs, cts.Token));
-            if (completedTask != executeTask)
-            {
-                return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"Script execution timed out after {timeoutMs}ms");
-            }
-
-            cts.Cancel();
-            var rawJsonResult = await executeTask;
-
-            object? parsedResult = null;
-            if (!string.IsNullOrEmpty(rawJsonResult) && rawJsonResult != "null")
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(rawJsonResult);
-                    parsedResult = doc.RootElement.Clone();
-                }
-                catch
-                {
-                    parsedResult = rawJsonResult;
-                }
-            }
-
-            // Return single result property without duplicating rawJsonResult
-            return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-            {
-                result = parsedResult
-            });
-        }
-        catch (Exception ex)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"Script execution error: {ex.Message}");
-        }
-    }
-
-    public async Task<HostResponse> HandleGetDocumentInfoAsync(HostCommand cmd)
-    {
-        if (!IsInitialized || _coreWebView2 == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        const string script = """
-            JSON.stringify({
-                href: window.location.href,
-                title: document.title,
-                readyState: document.readyState,
-                visibilityState: document.visibilityState,
-                hasFocus: document.hasFocus()
-            })
-            """;
-
-        var timeoutMs = cmd.TimeoutMs ?? 10000;
-        try
-        {
-            using var cts = new CancellationTokenSource(timeoutMs);
-            var executeTask = _coreWebView2.ExecuteScriptAsync(script);
-
-            var completedTask = await Task.WhenAny(executeTask, Task.Delay(timeoutMs, cts.Token));
-            if (completedTask != executeTask)
-            {
-                return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"GET_DOCUMENT_INFO timed out after {timeoutMs}ms");
-            }
-
-            cts.Cancel();
-            var rawJsonResult = await executeTask;
-
-            if (string.IsNullOrEmpty(rawJsonResult) || rawJsonResult == "null")
-            {
-                return HostResponse.CreateError(cmd.RequestId, cmd.Command, "GET_DOCUMENT_INFO returned null");
-            }
-
-            string innerJson;
-            try
-            {
-                using var doc = JsonDocument.Parse(rawJsonResult);
-                innerJson = doc.RootElement.ValueKind == JsonValueKind.String
-                    ? doc.RootElement.GetString() ?? "{}"
-                    : rawJsonResult;
-            }
-            catch
-            {
-                innerJson = rawJsonResult;
-            }
-
-            using var innerDoc = JsonDocument.Parse(innerJson);
-            var root = innerDoc.RootElement;
-
-            return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-            {
-                href = root.TryGetProperty("href", out var p) ? p.GetString() : string.Empty,
-                title = root.TryGetProperty("title", out p) ? p.GetString() : string.Empty,
-                readyState = root.TryGetProperty("readyState", out p) ? p.GetString() : string.Empty,
-                visibilityState = root.TryGetProperty("visibilityState", out p) ? p.GetString() : string.Empty,
-                hasFocus = root.TryGetProperty("hasFocus", out p) && p.GetBoolean()
-            });
-        }
-        catch (Exception ex)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"GET_DOCUMENT_INFO error: {ex.Message}");
-        }
-    }
-
-    public async Task<HostResponse> HandleGetPageTextAsync(HostCommand cmd)
-    {
-        if (!IsInitialized || _coreWebView2 == null)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, "WebView2 is not initialized");
-        }
-
-        const string script = "(function() { return (document.body && document.body.innerText) ? document.body.innerText : ''; })()";
-        var timeoutMs = cmd.TimeoutMs ?? 10000;
-        var maxLength = cmd.MaxLength ?? 4000;
-
-        try
-        {
-            using var cts = new CancellationTokenSource(timeoutMs);
-            var executeTask = _coreWebView2.ExecuteScriptAsync(script);
-
-            var completedTask = await Task.WhenAny(executeTask, Task.Delay(timeoutMs, cts.Token));
-            if (completedTask != executeTask)
-            {
-                return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"GET_PAGE_TEXT timed out after {timeoutMs}ms");
-            }
-
-            cts.Cancel();
-            var rawJsonResult = await executeTask;
-
-            string fullText = string.Empty;
-            if (!string.IsNullOrEmpty(rawJsonResult) && rawJsonResult != "null")
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(rawJsonResult);
-                    fullText = doc.RootElement.ValueKind == JsonValueKind.String
-                        ? doc.RootElement.GetString() ?? string.Empty
-                        : rawJsonResult;
-                }
-                catch
-                {
-                    fullText = rawJsonResult;
-                }
-            }
-
-            var originalLength = fullText.Length;
-            var truncated = false;
-            var text = fullText;
-
-            if (text.Length > maxLength)
-            {
-                text = text.Substring(0, maxLength);
-                truncated = true;
-            }
-
-            return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new
-            {
-                text = text,
-                length = originalLength,
-                truncated = truncated
-            });
-        }
-        catch (Exception ex)
-        {
-            return HostResponse.CreateError(cmd.RequestId, cmd.Command, $"GET_PAGE_TEXT error: {ex.Message}");
-        }
-    }
-
-    public HostResponse HandleClose(HostCommand cmd)
-    {
-        JsonLineProtocol.LogDiagnostic("CLOSE command received. Closing WebView2...");
-        Dispose();
-        return HostResponse.CreateSuccess(cmd.RequestId, cmd.Command, new { closed = true });
-    }
-
-    public void Dispose()
-    {
-        try
-        {
-            if (_controller != null)
-            {
-                _controller.IsVisible = false;
-                _controller.Close();
-                _controller = null;
-            }
-            _coreWebView2 = null;
-            _environment = null;
-        }
-        catch (Exception ex)
-        {
-            JsonLineProtocol.LogDiagnostic($"Error disposing WebView2: {ex.Message}");
-        }
-    }
-
-    private record NavigationResult(bool IsSuccess, string ErrorStatus, int HttpStatusCode);
-}
-```
-
----
-
-### Файл 6: `docs/architecture.md`
-```markdown
-# Архитектура Antigooglity
-
-Данный документ фиксирует актуальное архитектурное состояние проекта Antigooglity после реализации и стабилизации скрытого браузерного runtime на базе Microsoft WebView2, контроллера интерфейса Gemini (Этапы 1, 2, 3, 7.3, 7.3.1, 7.3.2) и подсистемы безопасности Security Presets & Git Integration (Этапы 7.4.2, 7.4.2.1, 7.4.2.2, 7.4.2.3, 7.4.2.4).
-
----
-
-## 1. Границы модулей
-
-Проект состоит из двух основных Gradle-модулей и вспомогательного автономного инструмента:
-
-1. **`:shared`** (Kotlin Multiplatform / JVM):
-   - **`commonMain`**: ядро агента (**Agent Core**), абстракции моделей (`ModelAdapter`), событийная модель (`AgentEvent`), интерфейсы и базовые mock-реализации инструментов, кроссплатформенные ресурсы. Не содержит платформо-зависимого кода WebView2.
-   - **`jvmMain`**:
-     - JVM-реализация координатора (**`AgentCoordinator`**, **`AgentFactory`**), модели безопасности (`SecurityPolicy`, `PolicyEnforcingToolExecutor`, `UiCommandApprover`, `SecurityPermissions`, `SecurityPreset`), парсеры аргументов инструментов и команд.
-     - Интеграция с локальным Git (**`JvmGitService`**): безопасное получение статуса, переключение веток, валидация через `git check-ref-format`, изоляция границ workspace.
-     - **Браузерный клиент (`com.limer.antigooglity.webview2`)**:
-       - `WebView2HostClient`: клиент дочернего процесса Host через JSON Lines IPC.
-       - `WebView2Protocol`: строгий RFC-8259 JSON-парсер (`SimpleJsonValue`) и контракт сообщений протокола.
-       - `GeminiDomController`: контроллер взаимодействия с Web UI Google Gemini (аудит состояния, ввод промпта, закрытие попапов, корреляция ходов диалога по устойчивым контейнерам).
-   - **`commonTest` / `jvmTest`**: unit- и интеграционные тесты Agent Core, координатора, моделей безопасности, Git-интеграции, WebView2 IPC и контроллера Gemini.
-
-2. **`:desktopApp`** (Compose Multiplatform Desktop Application):
-   - Точка входа в приложение (`MainKt`).
-   - Десктопный пользовательский интерфейс (UI) на базе Jetpack Compose for Desktop.
-   - Компоненты UI: `AntigravityComposer`, `Popups` (`PermissionPresetPopup`, `GitBranchSelectorPopup`), `InlineApprovalCard`, `SettingsDialog`.
-   - Зависит исключительно от `:shared`.
-
-3. **`tools/webview2-host`** (.NET 8 WinForms Host):
-   - Отдельный дочерний C#-процесс (`AntigooglityWebView2Host.exe`).
-   - Создаёт скрытый контрол Microsoft WebView2 (`IsVisible = false`) с постоянным пользовательским профилем.
-   - Поддерживает временный видимый диагностический режим (`SET_VISIBILITY`).
-   - Обеспечивает корректный STA Windows Message Loop и строго последовательное асинхронное исполнение команд через `System.Threading.Channels.Channel`.
-
----
-
-## 2. Архитектура Agent Core (`shared/commonMain`, `shared/jvmMain`)
-
-Agent Core представляет собой независимое, реактивное ядро выполнения автономных агентных циклов.
-
-### Ключевые компоненты:
-- **`Agent`**: фасад выполнения задачи. Принимает пользовательский запрос и координирует итерации `AgentLoop`.
-- **`AgentLoop`**: цикл рассуждений и действий (Reasoning and Action Loop). На каждой итерации:
-  1. Запрашивает следующее действие у `ModelAdapter`.
-  2. Генерирует событие `AgentEvent.Thinking`.
-  3. Если модель запрашивает вызовы инструментов (`ToolCall`), последовательно выполняет их через `ToolExecutor`.
-  4. Генерирует события `AgentEvent.ToolRequested` и `AgentEvent.ToolCompleted`.
-  5. Передаёт результаты работы инструментов обратно в контекст диалога.
-  6. При получении финального ответа модели завершает цикл событием `AgentEvent.Completed`.
-- **`AgentContext`**: хранит историю сообщений диалога (`AgentMessage`: `SYSTEM`, `USER`, `ASSISTANT`, `TOOL`), имя задачи и контекстные метаданные.
-- **`AgentConfig`**: конфигурация агента (системный промпт, ограничение максимального числа итераций `maxIterations`).
-- **`AgentEvent`**: типизированные события жизненного цикла (`Started`, `Thinking`, `ToolRequested`, `ToolCompleted`, `Completed`, `Failed`).
-- **`ToolCall` & `ToolResult`**: контракты вызова инструмента (ID, имя, JSON-аргументы) и результата его выполнения (ID, текстовый контент, флаг успешности).
-- **`ToolExecutor`**: интерфейс выполнения вызовов инструментов агентом.
-- **`ModelAdapter` & `ModelResponse`**: контракт интеграции языковой модели и структура её ответа (текст + список вызовов `ToolCall`).
-- **`AgentCoordinator`**: координатор прикладного уровня, связывающий Compose UI с ядром агента. Управляет переключением диалогов, состоянием выполнения (`ExecutionStatus`), потоками событий (`StateFlow`), директорией workspace, профилями безопасности (`SecurityPreset`), разрешениями (`SecurityPermissions`), одобрением команд (`UiCommandApprover`) и состоянием Git (`GitRepositoryInfo`).
-
----
-
-## 3. WebView2 Browser Runtime: архитектура и границы
-
-### 3.1 Граница Kotlin / .NET
-
-```
-+-----------------------------------------------------------+
-| Kotlin/JVM (:shared/jvmMain)                              |
-|                                                           |
-|  [GeminiDomController] ---> [WebView2HostClient]          |
-|                                     | (stdin/stdout)      |
-+-------------------------------------|---------------------+
-                                      | JSON Lines IPC
-+-------------------------------------|---------------------+
-| .NET 8 Host (AntigooglityWebView2Host.exe)                |
-|                                     v                     |
-|  [RunStdinReader] ---> [Channel<HostCommand>]             |
-|                                     | (Sequential STA)    |
-|                             [BrowserController]           |
-|                                     |                     |
-|                           [Microsoft WebView2]            |
-|                     (Hidden WinForms HWND / STA Loop)     |
-+-----------------------------------------------------------+
-```
-
-### 3.2 JSON Lines IPC Протокол
-
-Обмен между Kotlin и .NET Host осуществляется строками UTF-8 JSON Lines через перенаправленные потоки stdin / stdout:
-
-- **Команда из Kotlin (stdin Host):**
-  ```json
-  {
-    "requestId": "req-1a2b3c4d",
-    "command": "EXECUTE_SCRIPT",
-    "script": "(function() { ... })()",
-    "timeoutMs": 15000
-  }
-  ```
-- **Ответ от Host (stdout Kotlin):**
-  ```json
-  {
-    "requestId": "req-1a2b3c4d",
-    "command": "EXECUTE_SCRIPT",
-    "success": true,
-    "data": { "result": { ... } },
-    "error": null
-  }
-  ```
-
----
-
-## 4. Контроллер веб-интерфейса Gemini (`GeminiDomController`)
-
-### 4.1 Аудит состояния (`auditState`)
-- Проверяет URL (`https://gemini.google.com`).
-- Проверяет доступность DOM (`DOM_READY`).
-- Проверяет аутентификацию пользователя (`NEEDS_LOGIN`).
-- Обнаруживает модальные окна и уведомления (`BLOCKED_BY_POPUP`).
-- Проверяет доступность редактора ввода промпта (`EDITOR_NOT_FOUND`).
-- Проверяет текущую активность генерации (`isGenerating`).
-
-### 4.2 Ввод и отправка промпта (`sendPrompt`)
-1. **Закрытие блокирующих попапов**: вызов `dismissPopupsIfPresent()` перед вводом.
-2. **Предусловия**: хост строго `https://gemini.google.com`, редактор найден и доступен, генерация не выполняется, поле ввода пустое (при наличии текста — `EDITOR_NOT_EMPTY`).
-3. **Фиксация снимка диалога**: снимок контейнеров сообщений (`GeminiConversationSnapshot`) валидируется до модификации DOM.
-4. **Вставка и верификация текста**: текст вставляется через `document.execCommand('insertText', false, text)` и проверяется совпадение текста в редакторе с отправляемым промптом (`INSERTED_TEXT_MISMATCH`).
-5. **Однократный триггер отправки**: если кнопка отправки найдена, но отключена — Enter не отправляется автоматически, возвращается ошибка `SEND_BUTTON_DISABLED`.
-6. **Подтверждение отправки в DOM**: подтверждение требует фактического появления нового пользовательского сообщения в DOM с текстом отправленного промпта (только очистки редактора недостаточно). Если подтверждение не получено за 5 секунд, возвращается `SEND_NOT_CONFIRMED` без повторной отправки.
-
-### 4.3 Корреляция ходов диалога (`waitForResponse`)
-1. **Идентификация контейнеров**: контейнеры сообщений (`model-response`, `[data-test-id="model-response"]`) фильтруются от вложенных элементов (`message-content`, `.markdown`), гарантируя совпадение подсчёта в snapshot и в списке ответов.
-2. **Идентификация по ID и позиции**: фиксируются ID существующих ответов (`modelMessageIds`) и их количество (`modelResponseCount`). Новый ответ идентифицируется по появлению контейнера с новым ID или по индексу, строго превышающему предыдущий счётчик.
-3. **Идентичные ответы**: два последовательных ответа с одинаковым текстом корректно различаются как разные ходы благодаря независимым идентификаторам контейнеров и целевому индексу хода.
-4. **Стабилизация текста**: дожидается завершения генерации (`!isGenerating`) и совпадения текста нового ответа на протяжении 2 последовательных интервалов опроса.
-5. **Таймаут**: при истечении времени ожидания метод возвращает `found = false` (незавершённый ответ никогда не возвращается с `found = true`), а частичный текст возвращается в поле `partialText`.
-
----
-
-## 5. Подсистема безопасности и пресетов (Security Subsystem)
-
-Архитектура безопасности Antigooglity строго разделяет три уровня защиты:
-
-```
-+-------------------------------------------------------------------------+
-|                              ToolCall                                   |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-| 1. HARD ENFORCEMENT (Непреодолимые инварианты - ни один пресет не обходит) |
-| - Workspace Path Containment (канонизация realPath, запрет traversal ..)  |
-| - Null-byte injection rejection ('\0')                                  |
-| - Blocked commands list (format, shutdown, diskpart, regedit...)        |
-| - Shell argument deep inspection (запрет заблокированных утилит в bash/cmd) |
-| - Shell obfuscation & backslash stripping (r\m, f\ormat -> DENIED)      |
-| - PowerShell Base64 decoding & validation (-enc, -Encoded, UTF-16LE)    |
-| - Command substitution rejection in shell when delete forbidden ($(), `)  |
-| - Windows batch script prohibition (.bat, .cmd)                         |
-| - Wrapper unwrap analysis (sudo, doas, busybox, env, nohup, pkexec, xargs)|
-| - Strict xargs options parser & ambiguous flag rejection                |
-| - Opaque Git --config-env alias rejection when delete forbidden         |
-| - Git workspace containment (repoRoot строго внутри или равен workspace) |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-| 2. PERMISSION ENFORCEMENT (Статические права SecurityPermissions)       |
-| - allowReadFile / allowWriteFile / allowExecuteCommand                  |
-| - allowDeleteFile=false -> HARD DENY на удаление (rm, del, git clean...) |
-| - allowArbitraryCommands=false -> только белый список (DEFAULT_ALLOWED) |
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-| 3. APPROVAL POLICY (Динамические профили подтверждений SecurityPreset)   |
-| - REQUEST_REVIEW: 100% подтверждение всех разрешённых действий          |
-| - DEFAULT: read-only сразу, mutating Git, shell и dangerous через review|
-| - AUTO: read-only и новые файлы сразу; перезапись и терминал требуют review|
-| - TURBO: немедленное выполнение safe allowlisted и read-only Git;       |
-|          mutating Git, shell, dangerous, deletions, reset/clean -> review|
-+-------------------------------------------------------------------------+
-                                    |
-                                    v
-+-------------------------------------------------------------------------+
-|                    PolicyEnforcingToolExecutor                          |
-|    (Единый путь исполнения: UiCommandApprover -> Delegate ToolExecutor)  |
-+-------------------------------------------------------------------------+
-```
-
-### 5.1 Классификация Git-команд (Этап 7.4.2.4)
-
-Команды Git делятся на три чёткие категории с точки зрения безопасности:
-
-1. **Категория A: Read-Only Git Commands**
-   - Только операции чтения и диагностики, не изменяющие репозиторий, не запускающие внешние инструменты и не взаимодействующие с сетью:
-     - `status`, `diff` (без внешних флагов `--ext-diff`, `--textconv`, `--output`, `-o`), `log` (без внешних флагов), `show` (без внешних флагов), `rev-parse`, `check-ref-format`, `version`, `describe`, `ls-files`, `ls-tree`, `shortlog`.
-     - `branch` в режиме листинга (`git branch`, `-a`, `-r`, `-v`, `-l`, `--list`, `--list pattern`, `--show-current`, `--contains`).
-     - `tag` в режиме листинга или верификации (`git tag`, `-l`, `--list`, `-v`, `--verify`).
-     - `remote` в режиме локального чтения конфигурации (`git remote`, `-v`, `get-url`).
-   - Замечания по безопасности (Этап 7.4.2.5):
-     - `remote show`: обращается к удалённому серверу и запускает transport/credential helpers -> классифицируется как мутирующая/сетевая операция (`MUTATING`) и требует подтверждения (`REQUIRES_APPROVAL`).
-     - `diff`, `show`, `log`: при наличии флагов вызова внешних программ (`--ext-diff`, `--textconv`) или записи в файл (`--output`, `-o`) классифицируются как `MUTATING` и требуют подтверждения (`REQUIRES_APPROVAL`).
-     - `help`: способен запускать внешние браузеры, man pages или viewer -> исключён из `BASE_READ_ONLY_GIT_SUBCOMMANDS` (`UNKNOWN`) и требует подтверждения (`REQUIRES_APPROVAL`).
-   - Разрешены к немедленному выполнению (`ALLOWED_IMMEDIATE`) в пресетах `DEFAULT` и `TURBO` только строго локальные read-only запросы без внешних эффектов.
-
-2. **Категория B: Mutating Git Commands**
-   - Команды, способные изменять состояние индекса, рабочего каталога, конфигурации или истории, а также запускающие хуки (`core.hooksPath`, `.git/hooks`), smudge/clean фильтры, внешние merge drivers и credential helpers:
-     - `commit`, `add`, `checkout`, `switch`, `merge`, `rebase`, `reset`, `clean`, `restore`, `stash`, `fetch`, `pull`, `push`, `init`, `clone`, `cherry-pick`, `revert`, `config`, `am`, `apply`, `bundle`.
-     - `branch` с созданием, переименованием или удалением веток (`-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `--edit-description`, `--set-upstream-to`, создание ветки по имени).
-     - `tag` с созданием или удалением (`-d`, `--delete`, `-a`, `-s`, `-u`, `-f`, `--force`, создание тега).
-     - `remote` с добавлением или изменением (`add`, `rename`, `remove`, `rm`, `set-url`, `set-branches`, `set-head`, `prune`, `update`).
-   - **Всегда требуют подтверждения (`REQUIRES_APPROVAL`) в TURBO и DEFAULT**, независимо от флага `requireApprovalForDangerous`.
-
-3. **Категория C: Unknown Git Commands**
-   - Любая неизвестная подкоманда, кастомный Git alias или потенциальная внешняя подкоманда из `PATH`.
-   - Никогда не считается безопасной автоматически, даже если бинарный файл `git` находится в allowlist.
-   - **Всегда требует подтверждения (`REQUIRES_APPROVAL`) в TURBO и DEFAULT**.
-
-### 5.2 Парсинг утилиты `xargs` и ужесточение `--replace` (Этапы 7.4.2.4 — 7.4.2.5)
-
-Для предотвращения обхода ограничений на удаление файлов через `xargs` реализован специализированный конечный автомат разбора опций `parseXargsArgs`:
-- Поддерживает флаги с аргументом (`-d`, `-E`, `-e`, `-I`, `-i`, `-L`, `-l`, `-n`, `-P`, `-s`, `-a`), в том числе слитные формы (`-I{}`, `-P4`, `-n1`, `-ainput.txt`) и раздельные (`-I {}`, `-n 1`, `-a input.txt`).
-- Строго обрабатывает `--replace` и `--replace=VALUE` (Этап 7.4.2.5):
-  - `--replace` требует обязательный отдельный аргумент шаблона (например, `xargs --replace {} rm target`), шаблон корректно поглощается и не интерпретируется как целевая исполняемая команда.
-  - `--replace=VALUE` проверяет непустоту `VALUE` (пустые значения `--replace=` или `--replace=""` возвращают `isAmbiguous=true`).
-  - Пропуск аргумента или неоднозначный синтаксис немедленно помечает вызов как неоднозначный (`isAmbiguous=true`).
-- Поддерживает длинные опции с аргументом (`--max-args`, `--max-procs`, `--arg-file`, `--delimiter`, `--eof`, `--max-lines`, `--max-chars`).
-- Поддерживает флаги-переключатели (`-0`, `-p`, `-r`, `-t`, `-o`, `--null`, `--interactive`, `--no-run-if-empty`, `--verbose`, `--open-tty`, `--exact`, `--exit`) и их кластеры (`-0rt`, `-rP4`).
-- Поддерживает разделитель `--`.
-- Извлекает целевую команду и распаковывает её цепочку в `unwrapCommand`.
-- Если команда или параметры неоднозначны/неизвестны:
-  - При `allowDeleteFile = false` -> строго `DENIED`.
-  - При `allowDeleteFile = true` -> строго `REQUIRES_APPROVAL`.
-
-### 5.3 Git Hardening: Deletion, Aliases, External Helpers, Repo/User Config (Этапы 7.4.2.4, 7.4.2.6, 7.4.2.7)
-
-1. **Защита от удаления через `git rm`**:
-   - `git rm` классифицирован как мутирующая операция и распознаётся как физическое удаление файлов (`isTerminalDeletionCommand = true`).
-   - При `allowDeleteFile = false`: `git rm` (без `--cached`) строго возвращает `DENIED` во всех 4 пресетах безопасности (`REQUEST_REVIEW`, `DEFAULT`, `AUTO`, `TURBO`).
-   - При `allowDeleteFile = true`: `git rm` требует обязательного подтверждения пользователя (`REQUIRES_APPROVAL`), в том числе в `TURBO`.
-   - `git rm --cached` удаляет файлы только из индекса Git, оставляя файлы рабочего каталога нетронутыми. Классифицируется как мутирующая операция (`category = GitCategory.MUTATING`) и требует подтверждения (`REQUIRES_APPROVAL`), но не блокируется жестким запретом удаления файлов (`allowDeleteFile = false`).
-
-2. **Защита от удаляющих и непрозрачных Git Aliases**:
-   - Отслеживаются все формы определения алиасов: `-c alias.wipe=...`, `-calias.wipe=...`, `git config alias.wipe ...`, `--config-env=alias.wipe=...`, `--config-env alias.wipe=...`, а также секции `[alias]` в `.git/config`.
-   - Алиасы, раскрывающиеся в команды удаления (`clean`, `rm` без `--cached`, shell `!`, утилиты удаления файлов), возвращают `DENIED` при `allowDeleteFile = false` и `REQUIRES_APPROVAL` при `allowDeleteFile = true`.
-   - Непрозрачные алиасы через `--config-env`, значение которых скрыто в переменной окружения и не может быть безопасно проверено, возвращают `DENIED` при `allowDeleteFile = false` (удаление нельзя исключить) и `REQUIRES_APPROVAL` при `allowDeleteFile = true`.
-
-3. **Защита от запуска внешних программ через CLI, Config и Environment (Этап 7.4.2.7)**:
-   - Анализ не полагается только на аргументы командной строки: анализируются локальный `.git/config`, пользовательский `.gitconfig` и переменные окружения процесса (`GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_PAGER`, `GIT_CONFIG_*`).
-   - Проверяются все категории настроек внешних helpers:
-     `core.fsmonitor`, `core.pager`, `pager.*`, `diff.external`, `diff.*.command`, `diff.*.textconv`, `filter.*.clean`, `filter.*.smudge`, `filter.*.process`, `credential.*`, `remote.*.uploadpack`, `remote.*.receivepack`, `remote.*.vcs`, `mergetool.*.cmd`, `difftool.*.cmd`.
-   - Команды Git, содержащие или наследующие указанные настройки из любых источников конфигурации, лишаются права на автоматическое выполнение `ALLOWED_IMMEDIATE` и требуют подтверждения пользователя (`REQUIRES_APPROVAL`) даже в режимах `DEFAULT` и `TURBO`.
-
-4. **Классификация `git remote` (Этап 7.4.2.7)**:
-   - `git remote get-url origin`, `git remote -v`, `git remote` (без аргументов) классифицируются как безопасные `READ_ONLY` (`ALLOWED_IMMEDIATE`).
-   - `git remote show origin` (без `-n`) выполняет сетевые запросы к удалённому репозиторию с потенциальным запуском credential/transport helpers и строго классифицируется как `MUTATING` (`REQUIRES_APPROVAL`).
-   - `git remote show -n origin` не опрашивает удалённую сеть и допускается в `READ_ONLY` только при отсутствии внешних helpers.
-   - `git remote add/remove/rename/set-url/prune` классифицируются как `MUTATING` (`REQUIRES_APPROVAL`).
-
-5. **Интерактивный браузер авторизации аккаунта (`openGeminiBrowser`, Этап 7.4.2.7)**:
-   - Реализована автономная Gradle-задача `.\gradlew.bat :shared:openGeminiBrowser`, автоматически собирающая .NET Host (`dependsOn("buildWebView2Host")`) и запускающая хост WebView2 в видимом окне (`--visible-browser`) с URL `https://gemini.google.com`.
-   - Поддерживает автоматическое обнаружение `DOTNET_ROOT` в стандартных и пользовательских каталогах (`%LOCALAPPDATA%\Microsoft\dotnet`).
-   - Использует единый постоянный рабочий профиль `%LOCALAPPDATA%\Antigooglity\webview2-profile`.
-   - Защищена межпроцессным мьютексом (`Local\Antigooglity_WebView2_Profile_Instance_Mutex`). Окно остаётся активным до закрытия пользователем, после чего задача Gradle чисто завершается.
-
-### 5.4 Четыре профиля безопасности (`SecurityPreset`)
-
-1. **`REQUEST_REVIEW`**: Максимальный контроль. Любой ToolCall требует подтверждения пользователя через UI-карточку (`InlineApprovalCard`). Операции, запрещённые статическими правами, отклоняются сразу (`DENIED`), а не запрашиваются у пользователя.
-2. **`DEFAULT`**: Базовый баланс. Read-only операции с файлами и безопасные read-only команды Git (`status`, `diff`, `log`) выполняются немедленно (`ALLOWED_IMMEDIATE`). Мутирующие операции Git (`commit`, `add`, `checkout`, `merge`, `push` и т.д.), неизвестные команды Git, shell launchers и опасные команды требуют подтверждения (`REQUIRES_APPROVAL`).
-3. **`AUTO`**: Автономный режим с защитой от повреждения существующего кода. Read-only операции и создание *новых* файлов выполняются сразу (`ALLOWED_IMMEDIATE`). Перезапись *существующих* файлов требует подтверждения (`REQUIRES_APPROVAL`). Терминальные команды **не** считаются низкорисковыми и требуют подтверждения (`REQUIRES_APPROVAL`).
-4. **`TURBO`**: Высокая скорость. Разрешённые операции чтения, записи файлов, стандартные allowlisted команды и read-only команды Git выполняются сразу (`ALLOWED_IMMEDIATE`). **Исключения:** деструктивные операции Git (`git reset`, `git clean`, `checkout -f`), любые мутирующие операции Git (`commit`, `add`, `checkout`, `merge`), неизвестные команды/алиасы Git, команды удаления файлов, шелл-оболочки и известные опасные команды (sudo, apt, chmod) **требуют подтверждения даже в Turbo**.
-
-### 5.5 Модель безопасности и её границы (Security Model Limitations)
-
-Для корректной интерпретации гарантий безопасности Antigooglity строго разделяет 4 уровня контроля:
-
-1. **Контроль прямых файловых вызовов (`FileSystemToolExecutor`)**:
-   Обеспечивает детерминированную проверку канонических путей (`toRealPath()`), гарантирует непревышение границ workspace и предотвращает path traversal.
-2. **Семантический анализ известных терминальных команд (`TerminalToolExecutor`)**:
-   Анализирует токены, распаковывает известные утилиты-обёртки (`sudo`, `doas`, `busybox`, `env`, `nohup`, `pkexec`, `xargs`), парсит подкоманды Git (включая глобальные флаги, `--config-env` и alias definitions), нормализует шелл-экранирование (`\`, кавычки) и декодирует Base64.
-3. **Контроль запуска исполняемых сред (Runtime Execution)**:
-   Белый список команд (`DEFAULT_ALLOWED_COMMANDS`: `python`, `node`, `java`, `gradle`, `cargo`, `go` и т.д.) фильтрует исполняемые файлы, которым разрешён запуск. Однако сами по себе языковые среды исполнения являются Тьюринг-полными интерпретаторами: код, переданный скрипту Python или Node, исполняется в контексте текущего пользователя ОС. Статический анализ командной строки не может гарантировать безопасность произвольного кода внутри пользовательских скриптов.
-4. **Изоляция на уровне операционной системы (OS Sandbox)**:
-   Полноценная изоляция от произвольного вредоносного кода требует изоляции ядра ОС (Docker-контейнеры, gVisor, Linux namespaces/seccomp, Windows AppContainer). В текущей архитектуре Antigooglity OS-песочница не встроена; гарантии безопасности распространяются на инварианты ToolCall и политику подтверждения действий.
-
-### 5.6 Интеграция с Git (`JvmGitService`)
-- **Изоляция границ Workspace**: Если каталог Git-репозитория находится выше рабочего каталога агента (например, репозиторий `C:\Project`, а workspace задан как `C:\Project\Subdir`), доступ к родительскому репозиторию немедленно блокируется (`isGitRepository = false`) с ошибкой нарушения границ.
-- **Безопасность потоков**: Метод `readStreamBounded` вычитывает stdout и stderr параллельно до конца потока (EOF), предотвращая блокировку буфера каналов (pipe deadlock).
-- **Завершение дерева процессов**: При отмене корутины или таймауте (`GitTimeoutException`) принудительно уничтожается всё дерево дочерних процессов (`process.descendants() + destroyForcibly()`).
-- **Валидация веток**: Имена веток проверяются через `git check-ref-format --branch` без использования командного процессора.
-
----
-
-## 6. Организация тестирования
-
-### 6.1 Обычный прогон тестов (`:shared:allTests`)
-- Не отправляет сетевые запросы в реальный аккаунт Google Gemini.
-- Запускает:
-  - Unit- и интеграционные тесты `SecurityPolicyTest` (73 теста: проверка всех 4 пресетов, hard deny при `allowDeleteFile=false`, блокировка шеллов, деструктивных и мутирующих Git-команд, разбор `xargs --replace`, `--config-env`, wrapper unwrapping, классификация `diff/show/log/remote/help/branch/tag`, различие Auto vs Default).
-  - Интеграционные тесты `AgentCoordinatorTest` (проверка динамической смены пресета, привязки аргументов к approval UUID, отмены задач во время ожидания).
-  - Тесты `JvmGitServiceTest` (изоляция родительских репозиториев, валидация веток, таймауты, отмена дерева процессов).
-  - 15 unit-тестов `GeminiDomControllerTest`.
-  - 8 интеграционных тестов `WebView2HostIntegrationTest` на изолированном временном профиле.
-  - Все unit-тесты ядра агента и файловой системы.
-- Суммарно: 178 тестов (177 passed, 0 failures, 0 errors, 1 skipped).
-- Тест `GeminiRealSmokeTest` корректно пропускается через `Assume.assumeTrue` (1 skipped).
-
-### 6.2 Ручной реальный Smoke Test (`geminiRealSmokeTest`)
-```powershell
-.\gradlew.bat :shared:geminiRealSmokeTest
-```
-
----
-
-## 7. Статус и разделение с будущими этапами
-
-- **Реализовано и верифицировано:**
-  - .NET 8 WinForms WebView2 Host со скрытым режимом, очередью команд и безопасным завершением.
-  - Постоянный профиль авторизации Google.
-  - JSON Lines IPC протокол со строгим RFC-8259 JSON-парсером (`SimpleJsonValue`).
-  - `GeminiDomController` с проверками состояний, защитой от вложенных DOM-элементов, корреляцией ходов диалога по устойчивым контейнерам и защитой от ложного подтверждения отправки.
-  - Подсистема пресетов разрешений (Request Review, Default, Auto, Turbo) с полным аудитом, классификацией подкоманд Git, разбором `xargs`, защитой от обходов через `--config-env`, Git aliases, shell escaping, wrapper commands и hard deny защитой.
-  - Локальная интеграция с Git с контролем границ workspace и безопасным управлением процессами.
-  - 100% автоматических тестов проходят успешно.
-- **Будущий этап 7.4.3 (Планируется):**
-  - Реализация `GeminiWebView2ModelAdapter`, реализующего интерфейс `ModelAdapter`.
-  - Подключение адаптера к `AgentCoordinator` / `AgentLoop` для полноценного диалога агента с Gemini.
-  - Потоковая передача чанков ответа в события `AgentEvent.ModelStreamEvent`.
-  *(Компонент ModelAdapter для WebView2 ещё не реализован и не входит в состав текущей сборки)*.
-```
-
----
-
-Перехожу к публикации **Части 2** (полный исходный код `SecurityPolicy.kt`).
+Перехожу к публикации **Части 3** (полный исходный код `SecurityPolicyTest.kt` со всеми 16 разделами тестов и итоговыми критериями приёмки).
